@@ -31,10 +31,17 @@ cat subs_*.txt | sort -u > subs_all.txt
 ```
 Other passive sources worth adding: `github-subdomains`, `chaos` (ProjectDiscovery dataset), Wayback/`gau`, `assetfinder`.
 
+> **Resolver hygiene (§2F-DNS).** Every bulk `dnsx` / `puredns` / `gobuster dns` call passes
+> `-r ~/.config/offsec/resolvers.txt` and modest threads (`-t 25`). Sending brute-force volume to the
+> machine's default resolver buries a VM's NAT DNS proxy and takes the whole box offline — it looks
+> like a broken network but it is one weak component in the path. For subdomain brute-force prefer
+> `<framework repo>/utilities/resumable_subenum.sh`, which sets the resolver list, threads, rate and
+> checkpointing for you.
+
 ## Phase 2 — Resolve & validate (filter to scope)
 ```bash
 # Resolve to live hosts
-dnsx -l subs_all.txt -a -resp -silent -o resolved.txt
+dnsx -l subs_all.txt -a -resp -silent -t 25 -r ~/.config/offsec/resolvers.txt -o resolved.txt
 # Keep only in-scope, then find live web services
 httpx -l subs_all.txt -silent -status-code -title -tech-detect \
   -web-server -o live_hosts.txt
@@ -48,7 +55,7 @@ amass intel -asn <ASN> -o asn_ranges.txt
 whois -h whois.radb.net -- '-i origin AS<N>' | grep -Eo 'route:.*'
 # DNS records + zone hygiene
 dig +short target.example.com any
-dnsx -l subs_all.txt -cname -resp-only   # hunt dangling CNAMEs (subdomain takeover)
+dnsx -l subs_all.txt -cname -resp-only -t 25 -r ~/.config/offsec/resolvers.txt   # hunt dangling CNAMEs (subdomain takeover)
 ```
 Flag dangling CNAMEs pointing to unclaimed SaaS (S3, Azure, Heroku, GitHub Pages) — potential subdomain takeover (high impact, see web-vulnerability-hunting).
 

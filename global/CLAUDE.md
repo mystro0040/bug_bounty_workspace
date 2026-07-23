@@ -609,6 +609,36 @@ When you pause, stop, close an engagement, or hand back to the operator, **clean
   orphaned jobs remain AND the resume state is written.
 This is not optional and not DNS-specific — it applies to every background tool, every stop.
 
+## 2F-DNS. Resolver hygiene — never point bulk DNS at the machine's default resolver
+Heavy DNS work (subdomain brute-force, permutation resolution, mass PTR/CNAME lookups) must go to a
+LIST of public resolvers, never to whatever the box happens to use by default. On a VM the default is
+usually the hypervisor's built-in NAT DNS proxy (VMware/VirtualBox, typically `x.x.x.2`) — a
+single-threaded component that a brute-force run buries. Queries then time out, the whole machine
+looks like it lost the network, and the operator's own `git`/browser break. **This has bitten us:** a
+100-thread `dnsx` run made the operator's pushes fail and looked like a broken connection. It was not
+the network; it was one weak component in the path.
+- **Always pass an explicit resolver list** to `dnsx` / `puredns` / `massdns` / `gobuster dns`:
+  `-r ~/.config/offsec/resolvers.txt` (also shipped at `<FRAMEWORK_SOURCE repo>/utilities/resolvers.txt`).
+- **Pass the list as a FILE PATH — never as inline IPs.** `-r 8.8.8.8,1.1.1.1` is DENIED by the scope
+  hook, and correctly so: the hook cannot tell a resolver IP from a target IP, so an inline public-DNS
+  address reads as an out-of-scope target and fail-closed blocks it. `-r <path>` is allowed (verified).
+  If you ever see that denial, the fix is the file path — NOT dropping the resolver list, and never
+  arguing with the wall.
+- **Prefer the wrappers over a raw invocation** — they set resolvers, threads, rate and checkpointing
+  for you: `utilities/resumable_subenum.sh`, or `utilities/resumable_subenum.py` where `bash` is not in
+  the engagement's allow-list (the Python one resolves over DoH and rotates providers).
+- **Keep concurrency modest.** `dnsx` defaults to 100 threads; use **~25** (`-t 25`) plus the gentle
+  rate limit. Threads are connection-tracking entries, and the VM's table is small.
+- **Do NOT "fix" a flaky run by raising threads or rate.** Slow DNS under load is the symptom of
+  overloading something — back off, don't push harder.
+- **Fair use of public resolvers.** These are free services offered for general use; rotating across
+  several at a gentle aggregate rate is ordinary use. Never crank the rate to go faster — be a
+  considerate client of infrastructure nobody is billing us for.
+- **This is not scope-relevant and never changes what we touch.** Choosing which resolver answers our
+  lookups is a local networking decision — it does not alter, hide, or rotate our origin, so it is
+  categorically different from the VPN/Tor/proxy prohibition above, which is about concealing WHO is
+  connecting. Resolver choice is about not overloading a fragile local component.
+
 ## 2G. WAF / rate-limit block circuit-breaker (never hammer a wall; pivot, don't quit)
 
 Live programs sit behind WAFs/CDNs. Getting throttled or challenged occasionally is **normal and
