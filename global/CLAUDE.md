@@ -574,6 +574,26 @@ engagement and to any sub-agents you spawn.
 
 ---
 
+## 2F-PARALLEL. Run DIFFERENT engagements at once — per-session scope isolation (`$AO_ENGAGEMENT`)
+You can work several engagements in parallel (e.g. long enum on one while active-testing another), each
+walled to its OWN scope-lock, by pinning a terminal's engagement with an env var before launch:
+```
+AO_ENGAGEMENT=programs/hackerone/bounty/remitly     claude    # terminal A → Remitly ONLY
+AO_ENGAGEMENT=programs/hackerone/no-bounty/epic-games claude   # terminal B → Epic ONLY
+```
+The scope hook resolves `$AO_ENGAGEMENT` per session (falling back to the shared `active_engagement`
+pointer when unset). Isolation is real: terminal B's commands are gated to Epic's assets and **cannot
+touch Remitly's**, and vice-versa. Fail-closed: unset/invalid/missing scope-lock ⇒ locked.
+- **Confirm at session start** which engagement you're pinned to (`echo $AO_ENGAGEMENT`) before testing.
+- **Separate sessions, never the same resumed hash in two terminals** (that corrupts the transcript).
+
+**Quality first when parallel — do each engagement WELL, not many poorly:**
+- **Budget shared resources for the OTHER session too.** RAM (§2F) + CPU + the machine are shared — assume
+  ~half your usual concurrency when another engagement is active; never starve or OOM the box.
+- **Rate limits are PER-TARGET**, so different engagements on different hosts don't stack — BUT if two
+  sessions ever hit the SAME host, their rates ADD; keep the aggregate under the stricter program cap.
+- If parallelism would thin out either engagement's thoroughness, **run them sequentially instead.**
+
 ## 2F-STOP. Stop / pause CLEANLY — leave nothing running (a stop means a full stop)
 When you pause, stop, close an engagement, or hand back to the operator, **clean up after yourself.**
 "Stopped" must mean nothing you started is still touching the target or the machine.

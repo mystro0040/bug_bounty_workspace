@@ -114,20 +114,32 @@ def emit(decision, reason=""):
 
 
 def load_profile(project_dir):
-    pointer = os.path.join(project_dir, ".claude", "state", "active_engagement")
-    try:
-        with open(pointer, encoding="utf-8") as fh:
-            name = next((ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")), None)
-    except OSError:
-        return None, None
+    # Engagement selection, in priority order — enables PARALLEL work on DIFFERENT engagements
+    # in DIFFERENT terminals without them sharing one pointer:
+    #   1. $AO_ENGAGEMENT — a per-terminal env var. The hook subprocess inherits the launching
+    #      shell's environment, so `AO_ENGAGEMENT=programs/... claude …` pins THAT session to THAT
+    #      engagement's scope-lock, isolated from any other terminal.
+    #   2. the shared pointer file .claude/state/active_engagement (single-session default).
+    # Fail-closed: no valid selection => (None, None) => locked down. Path traversal is rejected so
+    # the name can only ever SELECT a scope-lock inside engagements/ — it can never widen or escape scope.
+    name = (os.environ.get("AO_ENGAGEMENT") or "").strip() or None
+    if not name:
+        pointer = os.path.join(project_dir, ".claude", "state", "active_engagement")
+        try:
+            with open(pointer, encoding="utf-8") as fh:
+                name = next((ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")), None)
+        except OSError:
+            return None, None
     if not name:
         return None, None
+    if os.path.isabs(name) or ".." in name.replace("\\", "/").split("/"):
+        return None, None                                   # never escape the engagements/ tree
     path = os.path.join(project_dir, "engagements", name, ".scope_lock", "enforcement.json")
     try:
         with open(path, encoding="utf-8") as fh:
             return name, json.load(fh)
     except (OSError, json.JSONDecodeError, ValueError):
-        # pointer set but profile unreadable => treat as locked (fail-closed), but signal name
+        # selected but profile unreadable => treat as locked (fail-closed), but signal name
         return name, {}
 
 
