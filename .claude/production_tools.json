@@ -1,0 +1,19 @@
+{
+  "_comment": "Centralized registry of your proprietary production tools. During an engagement these are STRICTLY READ-ONLY (Tier 0): never edit, patch, or commit to them in place. To use one, copy it into engagements/<name>/sandbox/<tool>/ and run/patch the isolated copy there. The enforcement hook (enforce_scope.py) blocks in-place mutation of any 'path' below; the copy-to-sandbox workflow stays allowed. See global/CLAUDE.md §2C. This is an EXAMPLE registry — replace the entries and paths with your own tools.",
+  "readonly_policy": "sandbox-copy",
+  "sandbox_subdir": "sandbox",
+  "production_tools": [
+    {
+      "name": "example_http_tester",
+      "kind": "HTTP auth / request testing tool",
+      "path": "<path-to-your-tool>",
+      "readonly": true
+    },
+    {
+      "name": "example_webapp_scanner",
+      "kind": "Custom web application scanner",
+      "path": "<path-to-your-tool>",
+      "readonly": true
+    }
+  ]
+}

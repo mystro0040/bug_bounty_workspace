@@ -1,0 +1,11 @@
+engagements/programs/
+engagements/_ACCOUNTS/shared-accounts.md
+**/.scope_lock/
+*.key
+*.pem
+.env
+**/target/
+__pycache__/
+*.pyc
+.venv/
+venv/
