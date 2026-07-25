@@ -63,6 +63,33 @@ def rate_for(concurrent_tools=None):
     return min(share, S.PER_ENGAGEMENT_MAX_RPS)            # per-engagement cap still wins
 
 
+def max_concurrent_tools():
+    """How many tools the global cap can actually cover.
+
+    Division bottoms out at 1 req/s — a tool rated below 1/s would stall — so beyond
+    GLOBAL_MAX_RPS concurrent tools the ceiling can no longer be met by dividing. Past that
+    point the real aggregate is (number of tools) x 1 req/s, which EXCEEDS the cap."""
+    return max(1, int(S.GLOBAL_MAX_RPS))
+
+
+def check_budget(concurrent_tools=None):
+    """(within_cap, projected_total_rps, message) — makes the breakdown above visible instead
+    of silent. Callers launching a fan-out should check this before starting the Nth tool."""
+    if S.raw_local_active() or not S.GLOBAL_RATE_LIMIT_ENABLED:
+        return True, None, "global rate limiting is OFF (raw-local ack or limiter disabled)"
+    if concurrent_tools is None:
+        concurrent_tools = _running_network_tools() + 1
+    n = max(1, int(concurrent_tools))
+    total = rate_for(n) * n
+    if n > max_concurrent_tools():
+        return (False, total,
+                f"OVER GLOBAL CAP: {n} concurrent tools x 1 req/s (the floor) = ~{total} req/s, "
+                f"above GLOBAL_MAX_RPS={S.GLOBAL_MAX_RPS}. Dividing further would stall tools. "
+                f"Run at most {max_concurrent_tools()} network tools at once, or raise "
+                f"GLOBAL_MAX_RPS in settings.py only if your ISP headroom genuinely allows it.")
+    return True, total, f"{n} tool(s) x {rate_for(n)} req/s = ~{total} req/s (cap {S.GLOBAL_MAX_RPS})"
+
+
 def _cli(argv):
     args = argv[1:]
     if "--for-new" in args:
@@ -81,6 +108,12 @@ def _cli(argv):
     print(f"network tools running now : {running}")
     print(f"rate for one MORE tool    : {rate_for()} req/s "
           f"(so {running + 1} tools stay under {S.GLOBAL_MAX_RPS}/s combined)")
+    print(f"max tools the cap covers  : {max_concurrent_tools()}")
+    ok, total, msg = check_budget()
+    print(f"budget check              : {msg}")
+    if not ok:
+        print("  [!] STOP STARTING TOOLS — the global cap can no longer be honoured.")
+        return 1
     return 0
 
 

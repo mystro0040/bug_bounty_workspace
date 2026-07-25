@@ -111,7 +111,17 @@ def is_usable(slug):
 
 
 def assert_usable(slug):
-    """Raise if the vendor is not cleared — used by remote_exec before any dispatch."""
+    """Raise if the vendor is not cleared — used by remote_exec before any dispatch.
+
+    Always raises PermissionError, never KeyError: an UNKNOWN vendor is a not-cleared vendor.
+    Callers guard dispatch with `except PermissionError` and fall back to local; letting a
+    KeyError escape here would crash the caller instead of falling back — i.e. an unrecognised
+    vendor slug (a typo in executors.json) would fail open into an unhandled exception."""
+    if slug not in VENDORS:
+        raise PermissionError(
+            f"vendor '{slug or '(empty)'}' is not in the vendor registry, so its acceptable-use "
+            f"policy has never been reviewed. Default-deny. Known vendors: "
+            f"{', '.join(sorted(VENDORS))}. Add it to vendors.py only after reading its AUP.")
     v = get(slug)
     if v["status"] != "allowed":
         raise PermissionError(

@@ -70,25 +70,68 @@ DNS_RATE_LIMIT = 20
 # is never affected by this setting and ALWAYS stays on this machine's direct
 # connection. See ORCHESTRATOR_LOCATION below and the hard rule at the bottom.
 #
-#   "auto"   -> DEFAULT + intended steady state: run tools REMOTE as soon as a remote
-#               executor is configured AND its vendor is cleared; otherwise fall back to
-#               local. So once the VPS is set up, tools-through-VPS becomes the default
-#               with no switch to flip. Until then (no VPS), it is local automatically.
+#   "auto"   -> DEFAULT: resolve to "remote" when a remote executor is configured AND its
+#               vendor is cleared; otherwise "local". Note "on the VPS", never "through"
+#               it — tools RUN on that box; traffic is not tunnelled/proxied through it.
 #   "local"  -> force local (a deliberate manual override — run here like before)
 #   "remote" -> force remote (fails if no usable executor is configured)
+#
+# ⛔ WHAT resolve_mode() DOES *NOT* DO — read before you trust it.
+# This is a DECLARATION of where tools SHOULD run. It is NOT a router. Nothing intercepts
+# a Bash call and re-dispatches it. A tool you invoke normally runs HERE, on the home IP,
+# no matter what this returns. The ONLY thing that runs a tool on the executor is calling
+# remote_exec.run_remote() explicitly.
+#
+# This comment used to claim remote became the default "with no switch to flip". That was
+# false for as long as it stood, and nobody caught it because it read confidently. The
+# rule it cost us: for every important behaviour, ask what ENFORCES it. Hook, test, or
+# code path -> a guarantee. "The agent reads this and complies" -> an intention. Label it.
 EXECUTE_MODE = "auto"
+
+
+def _load_vendors():
+    """Import the vendor registry however this module was loaded.
+
+    `from execution import vendors` alone only works when the PARENT of execution/ is on
+    sys.path — true for `from execution import settings`, false for `python3 execution/
+    settings.py`, which is exactly the command the §2 init protocol tells the agent to run.
+    That mismatch made resolve_mode() report "local" on a box that was configured remote:
+    a silent, wrong, and safety-relevant answer to the one question the agent came to ask.
+    So try every load style, and if the registry genuinely cannot be read, RAISE — never
+    quietly return an answer we cannot stand behind.
+    """
+    try:                                        # package-relative (normal import)
+        from . import vendors                   # noqa: PLC0415
+        return vendors
+    except ImportError:
+        pass
+    try:                                        # parent-on-path
+        from execution import vendors           # noqa: PLC0415
+        return vendors
+    except ImportError:
+        pass
+    import importlib.util, os.path              # sibling file, no package context
+    spec = importlib.util.spec_from_file_location(
+        "_offsec_vendors", os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendors.py"))
+    if spec and spec.loader:
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    raise ImportError("vendors.py could not be loaded; refusing to guess the execution mode.")
 
 
 def resolve_mode():
     """Resolve "auto" to the concrete mode. Returns "remote" only when at least one
     REMOTE_EXECUTORS entry is fully configured AND its vendor is CLEARED (status=allowed);
-    otherwise "local". Explicit "local"/"remote" are returned as-is."""
+    otherwise "local". Explicit "local"/"remote" are returned as-is.
+
+    A vendor registry that will not load is a hard error, not a fall-back to "local" —
+    "local" is a real instruction to put scan traffic on the home IP, and it must never be
+    reached by accident. See _load_vendors().
+    """
     if EXECUTE_MODE in ("local", "remote"):
         return EXECUTE_MODE
-    try:
-        from execution import vendors
-    except Exception:
-        return "local"
+    vendors = _load_vendors()
     for e in REMOTE_EXECUTORS:
         if e.get("host") and e.get("user") and vendors.is_usable(e.get("vendor", "")):
             return "remote"
@@ -189,10 +232,16 @@ UNATTENDED_DEFER_BULK_DNS = True           # skip mass-DNS unless attended or re
 
 
 def summary():
-    """One-line human summary of the active execution posture."""
-    where = EXECUTE_MODE
-    if EXECUTE_MODE == "remote":
-        where += f" -> {DEFAULT_EXECUTOR or '(no DEFAULT_EXECUTOR set!)'}"
+    """One-line human summary of the active execution posture.
+
+    Always reports the RESOLVED mode, never a bare "auto". The §2 init protocol tells the
+    agent to run this file and act on what it says, so "auto" alone would leave the one
+    question that matters — do my tools go out from home or from the box? — unanswered.
+    """
+    resolved = resolve_mode()
+    where = EXECUTE_MODE if EXECUTE_MODE == resolved else f"{EXECUTE_MODE}->{resolved}"
+    if resolved == "remote":
+        where += f" ON {DEFAULT_EXECUTOR or '(no DEFAULT_EXECUTOR set!)'}"
     if raw_local_active():
         cap = "OFF (RAW-LOCAL OVERRIDE ACTIVE)"
     else:
@@ -215,3 +264,17 @@ def banner():
 
 if __name__ == "__main__":
     print(summary())
+    _b = banner()
+    if _b:
+        print(_b)
+    # The §2 init protocol sends the agent here to answer "where do my tools run?". Answer it
+    # in full: resolving to remote is a REQUIREMENT to dispatch, not a promise that anything
+    # will. Saying so at the point of use is what stops the 2026-07-25 mistake recurring.
+    if resolve_mode() == "remote":
+        print(f"\n⛔ Tools for this session must RUN ON the executor '{DEFAULT_EXECUTOR}'.\n"
+              "   NOTHING routes automatically. A tool you invoke through Bash runs HERE, on the\n"
+              "   home IP. Dispatch it: execution.remote_exec.run_remote(cmd, engagement, pull=[...]).\n"
+              "   Check the box and its toolchain first: python3 execution/remote_data.py status")
+    else:
+        print("\n▶ Tools run LOCALLY, from this machine's own IP. No executor is usable "
+              "(none configured, or its vendor is not cleared in vendors.py).")
