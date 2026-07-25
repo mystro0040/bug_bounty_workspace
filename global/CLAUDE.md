@@ -277,7 +277,17 @@ standard, expected testing.
 >    out-of-scope assets, and any program-specific rules (rate limits, allowed test
 >    accounts, disclosure rules, **automation-permitted Y/N**) before you begin.
 >
-> You may not begin reconnaissance or testing of any asset until steps 1–4 are complete
+> 5. **Establish WHERE tools will run — before the first packet.** Run
+>    `python3 <FRAMEWORK_SOURCE>/utilities/execution/settings.py`. If execution resolves to
+>    **`remote`**, then for this engagement **every network-facing tool runs ON the executor**, not
+>    here (§2F-NET). Confirm the box is reachable and note which tools it actually has —
+>    `remote_data.py status` and `remote_data.py list`. State the result back to the operator in
+>    your summary: *"execution=remote, executor=<name>, tools available there: …"*.
+>    If a needed tool is missing on the box, say so up front and ask whether to install it there or
+>    run that step locally — do NOT silently run it locally. Nothing routes automatically; you
+>    dispatch, and you confirm you dispatched.
+>
+> You may not begin reconnaissance or testing of any asset until steps 1–5 are complete
 > and the operator has confirmed the target and scope.
 
 ---
@@ -737,8 +747,9 @@ come back here.
 (`execution/vendors.py`) that records that provider's AUP status. The framework runs on a vendor ONLY
 when its status is `allowed` (its AUP has been read/cleared for authorized testing) — a vendor that is
 `ask_first`/`unknown`/`prohibited` is refused until the operator clears it. `EXECUTE_MODE="auto"` (the
-default) auto-routes tools to a REMOTE executor the moment one is configured on a CLEARED vendor, else
-runs local — so once the VPS is set up, tools-through-VPS becomes the default with no switch to flip.
+default) RESOLVES to remote as soon as an executor is configured on a CLEARED vendor. **Resolving to
+remote is not the same as running remote** — it sets the expectation; YOU still dispatch (see the
+DEFAULT rule above).
 Check posture: `python3 <…>/execution/settings.py` and `…/execution/vendors.py --usable`.
 
 **Switching/rotating tool-executor IPs is safe** — they are isolated from Claude's connection, so their
@@ -750,14 +761,55 @@ today, but ONLY by setting `RAW_LOCAL_ACK` to its exact acknowledgement string �
 NOT enable it, and it is loud when active. It disables ONLY the global rate cap; it does NOT touch the
 scope-lock, the hard floor, the Anthropic-direct rule, or the other §2F protections.
 
-**ALL testing traffic routes through the executor when remote — not just DNS.** When execution
-resolves to remote, EVERY network-facing tool (subdomain enum, `httpx`, `nuclei`, `ffuf`, content
-discovery, AND exploit/PoC requests) dispatches to the VPS via `remote_exec.py`. The point is that
-the operator's home IP NEVER appears in a target's log — recon or exploitation. Do NOT run a
-network-testing tool directly against an in-scope target locally when a remote executor is available;
-that leaks the home IP and defeats the purpose. Offline-only work (analysing already-captured data,
-reading files) may stay local. Two agents (e.g. one enumerating, one exploiting) may both dispatch to
-the box concurrently.
+### ⛔ DEFAULT: network tools RUN ON THE EXECUTOR. You must dispatch them — nothing does it for you.
+
+**This is the single most important operational rule in this section. Read it twice.**
+
+`resolve_mode()` returning `"remote"` does **NOT** mean your tools are running remotely. It tells you
+where they **should** run. **Nothing routes automatically.** If you invoke a network tool directly
+through Bash, it runs HERE, on the operator's home IP, no matter what the mode says.
+
+**So, before running ANY network-facing tool against an in-scope target:**
+
+1. Check `python3 <FRAMEWORK_SOURCE>/utilities/execution/settings.py` (or `S.resolve_mode()`).
+2. If it says `remote` — **you SSH to the executor and run the tool THERE.** Use
+   `remote_exec.run_remote(cmd, engagement=..., pull=[...])`, which scope-checks the command locally
+   first, runs it on the box, and brings the results home.
+3. Only run it locally if the executor genuinely cannot (tool missing there and the operator has
+   approved a local run) — and when you do, **say so explicitly**: "this ran locally, on the home IP."
+
+This covers EVERY network-facing tool: subdomain enum, `httpx`, `nuclei`, `ffuf`, `katana`, content
+discovery, **and exploit/PoC requests**. The whole point is that the operator's home IP never appears
+in a target's logs — recon or exploitation. Offline work (analysing captured data, reading files)
+stays local; it generates no traffic.
+
+**This is a rule you follow, not a mechanism that happens to you.** A framework once claimed this was
+automatic when nothing implemented it, and every tool quietly ran from home for weeks. Do not assume
+offloading happened — make it happen, then confirm it did.
+
+**The executor is a SEPARATE machine with its own toolchain.** A tool installed here is not installed
+there. Remote dispatch fails closed on a missing binary and tells you what the box actually has —
+that is a missing prerequisite, not a failed scan. Install it there
+(`utilities/execution/provision_executor.sh`), or get approval to run that one step locally.
+
+**Engagement data does NOT live on the executor.** The box is a transient workspace, never storage.
+Target responses and host inventories are engagement material; leaving them on a rented VPS is a
+disclosure the program never agreed to. The lifecycle is **run → encrypt on the box → pull home →
+verify checksum → purge the remote copy → record in the ledger**
+(`utilities/execution/remote_data.py`). The box holds only a PUBLIC certificate, so it can encrypt to
+the operator but can never decrypt; the private key never leaves the operator's machine. Nothing is
+deleted before its checksum is verified — a failed pull leaves the remote copy intact and marks it
+`stranded`. **Run `remote_data.py sweep` before you stop:** "what is still sitting on that box?" must
+always be answerable without logging in and guessing.
+
+**Say "run tools on the executor," never "tunnel/route traffic through it."** They describe the same
+action, but the second is the language of proxying and pivoting — the silhouette of origin-hiding,
+which this framework forbids. What we actually do is mundane: SSH to a machine the operator owns and
+run a tool on it. We operate FROM an attributed box; we never hide BEHIND one, and we never rotate
+IPs to evade a control.
+
+Two agents (e.g. one enumerating, one exploiting) may both dispatch to the box concurrently — mind
+the shared rate budget (§2F) and the box's own RAM.
 
 **Watch the REMOTE box's resources too, not only the local machine (§2F).** When tools run on the VPS,
 the box's RAM/CPU/load is a shared budget exactly like local RAM. Before scaling up remote concurrency,
