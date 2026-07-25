@@ -186,6 +186,52 @@ ORCHESTRATOR_LOCATION = "home"             # "home" | "control-vps"
 
 
 # =============================================================================
+# 2B. EXECUTION PROFILE — how isolated this engagement is
+# =============================================================================
+# EXECUTE_MODE above answers "local or remote". This answers "how isolated", and the two are
+# independent: a profile says WHERE work of each kind is allowed to go.
+#
+#   "linode"         DEFAULT + validated. Everything runs on the Linode executor. Bulk and
+#                    interactive alike. This is the posture proven working on 2026-07-25.
+#
+#   "staged-hybrid"  Bulk work (scanners, fuzzers, enumeration, automated exploit tooling) is
+#                    generated here, pushed to a private staging repo, and run on an isolated
+#                    VM behind a PIA dedicated IP with NO AI present. Interactive work — a small
+#                    number of hand-shaped requests whose next step depends on the last response —
+#                    still runs live on the executor, because shipping it would break the feedback
+#                    loop that makes it useful.
+#                    ⚠️ That interactive path is a DELIBERATE, BUDGETED exception to full
+#                    isolation. It is logged and capped; it is not silent.
+#
+#   "staged-strict"  Everything ships to the isolated VM. Nothing from this machine or the
+#                    executor touches the target. Maximum isolation, no live feedback loop.
+#
+# Classification is NOT by tool name alone — see traffic_class.py. A known bulk binary is bulk
+# whatever its flags; anything else is interactive only until it exhausts a per-engagement request
+# budget, at which point it stops being interactive by definition. The budget is a counter on disk,
+# not a promise: "curl in a for-loop" is a scanner, and the counter is what notices.
+EXECUTION_PROFILE = "linode"
+
+# A PIA dedicated IP is a STATIC, ATTRIBUTABLE datacenter address. That is the opposite of IP
+# rotation, which is edge-WAF evasion and a hard red line elsewhere in this framework. Same
+# technology, opposite intent — worth stating so nobody conflates them later.
+
+
+def resolve_profile():
+    """Validate and return the execution profile, failing closed to the most isolated option.
+
+    An unrecognised profile does NOT fall back to the default: a typo must not silently select the
+    least isolated posture. It raises, and the caller stops.
+    """
+    from execution.traffic_class import PROFILES          # noqa: PLC0415
+    if EXECUTION_PROFILE not in PROFILES:
+        raise ValueError(
+            f"EXECUTION_PROFILE={EXECUTION_PROFILE!r} is not one of {PROFILES}. Refusing to guess "
+            f"— a typo here would silently choose a less isolated posture than you intended.")
+    return EXECUTION_PROFILE
+
+
+# =============================================================================
 # 3. LOCAL-TOOL VPN — DELIBERATELY NOT IMPLEMENTED (read this)
 # =============================================================================
 # There is NO code path to route THIS machine's tool traffic through a VPN, on
