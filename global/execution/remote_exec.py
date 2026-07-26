@@ -41,6 +41,7 @@ Usage (only when settings.EXECUTE_MODE == "remote"):
                         pull=["out.txt"])
 """
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -93,7 +94,8 @@ def _scope_ok(command, engagement):
     return decision == "allow", reason
 
 
-def run_remote(command, engagement, name=None, pull=None, timeout=None, secure_pull=True):
+def run_remote(command, engagement, name=None, pull=None, timeout=None, secure_pull=True,
+               inputs=None):
     """Dispatch `command` to a remote executor after LOCAL scope validation, then bring
     any `pull` result files home. Returns a dict.
 
@@ -102,6 +104,28 @@ def run_remote(command, engagement, name=None, pull=None, timeout=None, secure_p
     only when you deliberately want the remote copy left in place (e.g. a resumable run
     that is not finished) — and remember `remote_data.py sweep` is then how you find it
     again.
+
+    `inputs` is a list of LOCAL files the command reads (a resolved-host list, a candidate
+    wordlist). The command should reference them by BASENAME, because that is what they are
+    called in the remote workdir:
+
+        run_remote("dnsx -l hosts.txt -o out.txt", eng,
+                   inputs=["~/…/hosts.txt"], pull=["out.txt"])
+
+    Why this exists, and why it is not a loophole:
+
+    The scope hook must read a target list to verify every host in it — a list is exactly how
+    `nmap -iL` would otherwise smuggle an out-of-scope target past the asset wall. But the hook
+    runs HERE and the file lives THERE, so a bare remote basename is unreadable and the hook
+    correctly fail-closes. Passing the local originals lets the hook read the real bytes.
+
+    The substitution is validate-only: scope sees the local path, the box runs the basename.
+    That is sound because push() compares sha256 on the far side, so "the file the hook read"
+    and "the file the tool will read" are proven byte-identical before anything is dispatched.
+    Without that checksum this would be a hole, not a bridge.
+
+    Ordering is deliberate: SCOPE FIRST, then upload. A denied command must never result in an
+    engagement's target list sitting on a VPS.
     """
     if S.resolve_mode() != "remote":
         raise RemoteError("execution resolves to 'local' — refusing remote dispatch. Configure a "
@@ -116,98 +140,142 @@ def run_remote(command, engagement, name=None, pull=None, timeout=None, secure_p
     from execution import vendors
     vendors.assert_usable(vendor)          # raises PermissionError if not cleared
 
-    ok, reason = _scope_ok(command, engagement)
+    # Rewrite remote basenames to their local originals FOR VALIDATION ONLY, so the scope hook
+    # can actually read the target lists it is required to verify. See the docstring.
+    validate_cmd = command
+    local_inputs = [os.path.expanduser(p) for p in (inputs or [])]
+    for local in local_inputs:
+        if not os.path.isfile(local):
+            raise RemoteError(f"input file not found: {local} — refusing to dispatch a command "
+                              f"whose targets cannot be scope-checked.")
+        base = os.path.basename(local)
+        if not re.search(rf"(?<![\w./-]){re.escape(base)}(?![\w.-])", validate_cmd):
+            raise RemoteError(f"input '{base}' was supplied but the command never references it; "
+                              f"refusing rather than dispatching something unverified.")
+        validate_cmd = re.sub(rf"(?<![\w./-]){re.escape(base)}(?![\w.-])",
+                              local.replace("\\", "\\\\"), validate_cmd)
+
+    ok, reason = _scope_ok(validate_cmd, engagement)
     if not ok:
         raise RemoteError(f"SCOPE DENIED locally — not dispatching remotely. {reason}")
+
+    # Authorized — only now does anything leave this machine.
+    pushed_inputs = []
+    if local_inputs:
+        from execution import remote_data as RD
+        up = RD.push(local_inputs, engagement, name=e["name"])
+        if up["stranded"] or len(up["pushed"]) != len(local_inputs):
+            RD.purge_remote(up["pushed"], name=e["name"])       # leave nothing half-staged
+            raise RemoteError(f"input upload failed verification: {up['stranded']}")
+        pushed_inputs = up["pushed"]
+
     key = os.path.expanduser(e["ssh_key"])
     dest = f"{e['user']}@{e['host']}"
     workdir = e.get("workdir", "~/run")
     ssh_base = ["ssh", "-i", key, "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=accept-new", dest]
 
-    wrapped = f"mkdir -p {shlex.quote(workdir)} && cd {shlex.quote(workdir)} && "
-    to = timeout or S.UNATTENDED_TOOL_TIMEOUT
-    wrapped += f"timeout {shlex.quote(to)} bash -lc {shlex.quote(command)}"
+    try:
+        wrapped = f"mkdir -p {shlex.quote(workdir)} && cd {shlex.quote(workdir)} && "
+        to = timeout or S.UNATTENDED_TOOL_TIMEOUT
+        wrapped += f"timeout {shlex.quote(to)} bash -lc {shlex.quote(command)}"
 
-    run = subprocess.run(ssh_base + [wrapped], capture_output=True, text=True)
-    result = {"executor": e["name"], "host": e["host"], "rc": run.returncode,
-              "stdout": run.stdout, "stderr": run.stderr, "pulled": []}
+        run = subprocess.run(ssh_base + [wrapped], capture_output=True, text=True)
+        result = {"executor": e["name"], "host": e["host"], "rc": run.returncode,
+                  "stdout": run.stdout, "stderr": run.stderr, "pulled": []}
 
-    # The executor is a SEPARATE machine with its own toolchain — a tool present locally is not
-    # necessarily installed there. Without this, a missing remote binary surfaces only as a bare
-    # rc=127, which reads like a failed scan rather than a missing prerequisite, and invites a
-    # pointless retry. Name it, and say what the box actually has.
-    if run.returncode == 127 or "command not found" in (run.stderr or ""):
-        try:
-            tool = shlex.split(command)[0]
-        except ValueError:
-            tool = command.split()[0] if command.split() else "?"
-        # -1 and a per-dir loop: a bare multi-dir `ls` emits "dir:" headers that pollute the list.
-        have = subprocess.run(
-            ssh_base + ["for d in /usr/local/bin ~/go/bin ~/.local/bin; do "
-                        "[ -d \"$d\" ] && ls -1 \"$d\"; done 2>/dev/null"],
-            capture_output=True, text=True).stdout.split()
-        have = [t for t in have if not t.endswith((":", ".sh"))]
-        result["missing_tool"] = tool
-        result["executor_tools"] = sorted(set(have))
-        result["reason"] = (
-            f"'{tool}' is NOT installed on executor '{e['name']}' ({e['host']}). Execution is remote, "
-            f"so the tool must exist THERE, not just locally. Installed there: "
-            f"{', '.join(sorted(set(have))) or '(none found)'}. Install it on the box, or run this "
-            f"step with EXECUTE_MODE='local' — noting local runs put the traffic on the home IP.")
+        # The executor is a SEPARATE machine with its own toolchain — a tool present locally is not
+        # necessarily installed there. Without this, a missing remote binary surfaces only as a bare
+        # rc=127, which reads like a failed scan rather than a missing prerequisite, and invites a
+        # pointless retry. Name it, and say what the box actually has.
+        if run.returncode == 127 or "command not found" in (run.stderr or ""):
+            try:
+                tool = shlex.split(command)[0]
+            except ValueError:
+                tool = command.split()[0] if command.split() else "?"
+            # -1 and a per-dir loop: a bare multi-dir `ls` emits "dir:" headers that pollute the list.
+            have = subprocess.run(
+                ssh_base + ["for d in /usr/local/bin ~/go/bin ~/.local/bin; do "
+                            "[ -d \"$d\" ] && ls -1 \"$d\"; done 2>/dev/null"],
+                capture_output=True, text=True).stdout.split()
+            have = [t for t in have if not t.endswith((":", ".sh"))]
+            result["missing_tool"] = tool
+            result["executor_tools"] = sorted(set(have))
+            result["reason"] = (
+                f"'{tool}' is NOT installed on executor '{e['name']}' ({e['host']}). Execution is remote, "
+                f"so the tool must exist THERE, not just locally. Installed there: "
+                f"{', '.join(sorted(set(have))) or '(none found)'}. Install it on the box, or run this "
+                f"step with EXECUTE_MODE='local' — noting local runs put the traffic on the home IP.")
 
-    # ------------------------------------------------------------------ data lifecycle
-    # The executor is a TRANSIENT WORKSPACE, never a data store. Engagement material left
-    # on a rented VPS is a disclosure the program never agreed to — so results are encrypted
-    # on the box, pulled home, VERIFIED, and only then purged. See remote_data for the
-    # reasoning behind each step; the invariant that matters here is that nothing is deleted
-    # before its checksum has been confirmed to match.
-    if pull:
-        try:
-            from execution import remote_data as RD
-        except ImportError:
-            RD = None
+        # ------------------------------------------------------------------ data lifecycle
+        # The executor is a TRANSIENT WORKSPACE, never a data store. Engagement material left
+        # on a rented VPS is a disclosure the program never agreed to — so results are encrypted
+        # on the box, pulled home, VERIFIED, and only then purged. See remote_data for the
+        # reasoning behind each step; the invariant that matters here is that nothing is deleted
+        # before its checksum has been confirmed to match.
+        if pull:
+            try:
+                from execution import remote_data as RD
+            except ImportError:
+                RD = None
 
-        if RD is None or not secure_pull:
-            # Plain rsync fallback: retrieves results but leaves the remote copy in place.
-            local_dir = os.path.join(BUCKET, "engagements", engagement or "_unfiled",
-                                     "02_Reconnaissance", "remote")
-            os.makedirs(local_dir, exist_ok=True)
-            for f in pull:
-                src = f"{dest}:{workdir}/{f}"
-                rs = subprocess.run(["rsync", "-az", "-e", f"ssh -i {key}", src, local_dir + "/"],
-                                    capture_output=True, text=True)
-                if rs.returncode == 0:
-                    result["pulled"].append(os.path.join(local_dir, os.path.basename(f)))
-            result["lifecycle"] = "plain-rsync (remote copies NOT purged)"
-            return result
+            if RD is None or not secure_pull:
+                # Plain rsync fallback: retrieves results but leaves the remote copy in place.
+                local_dir = os.path.join(BUCKET, "engagements", engagement or "_unfiled",
+                                         "02_Reconnaissance", "remote")
+                os.makedirs(local_dir, exist_ok=True)
+                for f in pull:
+                    src = f"{dest}:{workdir}/{f}"
+                    rs = subprocess.run(["rsync", "-az", "-e", f"ssh -i {key}", src, local_dir + "/"],
+                                        capture_output=True, text=True)
+                    if rs.returncode == 0:
+                        result["pulled"].append(os.path.join(local_dir, os.path.basename(f)))
+                result["lifecycle"] = "plain-rsync (remote copies NOT purged)"
+                return result
 
-        remote_paths = [f if f.startswith(("/", "~")) else f"{workdir}/{f}" for f in pull]
+            remote_paths = [f if f.startswith(("/", "~")) else f"{workdir}/{f}" for f in pull]
 
-        # Encrypt in place first: this covers the window between the tool finishing and the
-        # pull completing, and anything stranded by a failed transfer. Best-effort — a box
-        # without the public cert yet should still return results rather than lose them.
-        try:
-            encrypted = RD.encrypt_remote(remote_paths, name=e["name"])
-            result["encrypted"] = encrypted
-            targets = encrypted
-        except Exception as exc:                      # noqa: BLE001 — never lose data to a crypto hiccup
-            result["encrypt_error"] = str(exc)
-            result["encrypt_hint"] = ("run `remote_data.py setup` to install the public cert on "
-                                      "the executor; pulling unencrypted for now.")
-            targets = remote_paths
+            # Encrypt in place first: this covers the window between the tool finishing and the
+            # pull completing, and anything stranded by a failed transfer. Best-effort — a box
+            # without the public cert yet should still return results rather than lose them.
+            try:
+                encrypted = RD.encrypt_remote(remote_paths, name=e["name"])
+                result["encrypted"] = encrypted
+                targets = encrypted
+            except Exception as exc:                      # noqa: BLE001 — never lose data to a crypto hiccup
+                result["encrypt_error"] = str(exc)
+                result["encrypt_hint"] = ("run `remote_data.py setup` to install the public cert on "
+                                          "the executor; pulling unencrypted for now.")
+                targets = remote_paths
 
-        life = RD.pull(targets, engagement, name=e["name"], purge=True, decrypt=True)
-        result["pulled"] = life["pulled"]
-        result["files"] = life["files"]        # what to actually open — see remote_data.pull()
-        result["verified"] = life["verified"]
-        result["decrypted"] = life["decrypted"]
-        result["purged"] = life["purged"]
-        result["stranded"] = life["stranded"]
-        result["lifecycle"] = "encrypt -> pull -> verify -> purge -> ledger"
-        if life["stranded"]:
-            result["warning"] = (f"{len(life['stranded'])} artifact(s) NOT purged — they remain on "
-                                 f"{e['host']}. Run `remote_data.py sweep` to review.")
+            life = RD.pull(targets, engagement, name=e["name"], purge=True, decrypt=True)
+            result["pulled"] = life["pulled"]
+            result["files"] = life["files"]        # what to actually open — see remote_data.pull()
+            result["verified"] = life["verified"]
+            result["decrypted"] = life["decrypted"]
+            result["purged"] = life["purged"]
+            result["stranded"] = life["stranded"]
+            result["lifecycle"] = "encrypt -> pull -> verify -> purge -> ledger"
+            if life["stranded"]:
+                result["warning"] = (f"{len(life['stranded'])} artifact(s) NOT purged — they remain on "
+                                     f"{e['host']}. Run `remote_data.py sweep` to review.")
+    finally:
+        # Inputs are plaintext engagement material on a rented box — a target list names the
+        # program. They come off the moment the tool no longer needs them, on EVERY exit path
+        # including a crash or a timeout, which is why this is a finally and not a tidy-up at
+        # the end of the happy path.
+        if pushed_inputs:
+            try:
+                from execution import remote_data as _RD
+                gone = _RD.purge_remote(pushed_inputs, name=e["name"])
+                result_inputs = {"purged": gone["purged"], "failed": gone["failed"]}
+            except Exception as exc:                       # noqa: BLE001
+                result_inputs = {"purged": [], "failed": pushed_inputs, "error": str(exc)}
+            try:
+                result["inputs"] = result_inputs
+            except NameError:                              # dispatch died before `result` existed
+                pass
+
     return result
 
 
