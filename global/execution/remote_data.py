@@ -37,6 +37,7 @@ CLI:
     python3 remote_data.py setup                  # generate keypair, install cert on box
     python3 remote_data.py list                   # what is on the box right now
     python3 remote_data.py sweep                  # reconcile ledger vs box, show stranded
+    python3 remote_data.py push --files t.txt --engagement E   # send an input up, verified
     python3 remote_data.py sweep --purge          # ...and purge everything remaining
 """
 import argparse
@@ -276,6 +277,60 @@ def purge_remote(paths, name=None):
     return {"purged": purged, "failed": failed}
 
 
+def push(files, engagement, name=None, remote_dir=None):
+    """Send INPUT files (target lists, candidate wordlists) to the executor, verified.
+
+    The mirror of pull(), and the same discipline: nothing is trusted to have arrived until
+    its checksum is compared on the far side. A truncated target list is worse than a failed
+    transfer, because the tool runs happily against the part that made it and the operator
+    reads a short result as a real one.
+
+    HONEST ASYMMETRY, worth stating plainly: outputs can be encrypted on the box because the
+    box only ever needs to WRITE them. Inputs cannot — a tool has to read its own input, so a
+    target list sits in plaintext on the executor for the life of the run. That list names the
+    engagement, so it is engagement data and it is exposed while it is there. Two consequences:
+
+      * every pushed file is recorded in the ledger as `remote`, so `sweep` sees it and
+        `sweep --purge` removes it. Inputs are cleaned up exactly like outputs.
+      * push only what the run needs. Do not stage a whole engagement's material on the box.
+
+    Returns {"pushed": [...], "stranded": [...], "remote_dir": ...}.
+    """
+    e = _executor(name)
+    wd = remote_dir or e.get("workdir", "~/run")
+    _remote(e, f"mkdir -p {shlex.quote(wd)} && chmod 700 {shlex.quote(wd)}")
+
+    out = {"pushed": [], "stranded": [], "remote_dir": wd}
+    for f in files:
+        local = os.path.expanduser(f)
+        if not os.path.isfile(local):
+            out["stranded"].append({"path": local, "reason": "local file not found"})
+            continue
+        lsha = _sha256_local(local)
+        rpath = posixpath.join(wd, os.path.basename(local))
+
+        rs = _run(["rsync", "-az", "-e",
+                   f"ssh -i {os.path.expanduser(e['ssh_key'])} -o BatchMode=yes",
+                   local, f"{e['user']}@{e['host']}:{rpath}"])
+        if rs.returncode != 0:
+            out["stranded"].append({"path": local, "reason": f"rsync failed: {rs.stderr[:120]}"})
+            continue
+
+        # VERIFY on the far side before calling it delivered. A partial upload that nobody
+        # checked is how a 640-host list silently becomes a 200-host list.
+        rsha = _remote_sha(e, rpath)
+        if rsha != lsha:
+            out["stranded"].append({"path": local,
+                                    "reason": f"checksum mismatch on executor (got {rsha})"})
+            purge_remote([rpath], name=e["name"])      # do not leave a corrupt input lying around
+            continue
+
+        out["pushed"].append(rpath)
+        ledger_record(e["name"], engagement, rpath, "remote", sha256=lsha,
+                      local_path=local, kind="input")
+    return out
+
+
 def pull(files, engagement, name=None, local_dir=None, purge=True, decrypt=True):
     """Pull remote artifacts home, VERIFY, then purge the remote copy.
 
@@ -425,7 +480,8 @@ def status(name=None):
 
 def _main():
     ap = argparse.ArgumentParser(description="Remote engagement-data lifecycle.")
-    ap.add_argument("action", choices=["status", "setup", "list", "sweep", "pull", "purge"])
+    ap.add_argument("action",
+                    choices=["status", "setup", "list", "sweep", "push", "pull", "purge"])
     ap.add_argument("--executor")
     ap.add_argument("--engagement")
     ap.add_argument("--files", nargs="*", default=[])
@@ -443,6 +499,8 @@ def _main():
             out = list_remote(a.executor)
         elif a.action == "sweep":
             out = sweep(a.executor, purge=a.purge)
+        elif a.action == "push":
+            out = push(a.files, a.engagement, name=a.executor)
         elif a.action == "pull":
             out = pull(a.files, a.engagement, name=a.executor, purge=not a.no_purge)
         elif a.action == "purge":
