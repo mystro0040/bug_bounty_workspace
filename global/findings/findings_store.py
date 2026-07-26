@@ -300,6 +300,150 @@ def listing(engagement):
     return load_index(paths(engagement))["findings"]
 
 
+# --------------------------------------------------------------------------- cross-engagement index
+# Where the roll-up index is written. Findings themselves NEVER move — this is a pointer file
+# so you can see everything at a glance instead of walking every engagement directory.
+#
+# PRIVATE DESTINATIONS ONLY. The index names engagements, and at least one is an NDA program;
+# listing it publicly would disclose participation. The execution layer is routinely propagated
+# to a PUBLIC repo copy, so "just put it next to the other synced files" is exactly how this
+# would leak. _assert_private() below is the mechanism that stops it.
+INDEX_DESTINATIONS = [
+    os.path.expanduser("~/Workspace/buckets/bug-bounty-workspace-bucket"),
+    os.path.expanduser("~/Workspace/Production_Ready/private/Offensive_Operations/bug_bounty_workspace"),
+]
+INDEX_FILENAME = "FINDINGS.md"
+
+# A path segment that means "this tree is published". Deliberately crude and deliberately
+# over-broad: a false refusal costs a moment, a false permit is permanent.
+_PUBLIC_MARKERS = ("/public/", "/Offensive_Security/", "/docs/", "/www/")
+
+
+def _assert_private(root):
+    """Refuse to write the roll-up anywhere that looks published."""
+    real = os.path.realpath(root) + "/"
+    for marker in _PUBLIC_MARKERS:
+        if marker in real:
+            raise FindingsError(
+                f"refusing to write {INDEX_FILENAME} to {root}: the path contains {marker!r}, "
+                f"which marks a published tree. This index names engagements — including NDA "
+                f"programs — and must never be committed to a public repository.")
+    return real
+
+
+def discover(engagements_root=None):
+    """Find every engagement that has recorded findings. Returns [(engagement, [findings])]."""
+    root = engagements_root or ENGAGEMENTS
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if os.path.basename(dirpath) != "findings" or "INDEX.json" not in filenames:
+            continue
+        dirnames[:] = []                                   # do not descend into .vault
+        eng = os.path.relpath(os.path.dirname(dirpath), root)
+        try:
+            items = load_index(paths(eng))["findings"]
+        except FindingsError:
+            items = None                                   # damaged index: surface, never skip
+        out.append((eng, items))
+    return sorted(out, key=lambda x: x[0])
+
+
+_SEV_ORDER = {s: i for i, s in enumerate(SEVERITIES)}
+
+
+def build_index(engagements_root=None):
+    """Render the roll-up as markdown. Pure function of what is on disk."""
+    found = discover(engagements_root)
+    root = engagements_root or ENGAGEMENTS
+    rows, damaged, total = [], [], 0
+    for eng, items in found:
+        if items is None:
+            damaged.append(eng)
+            continue
+        for f in items:
+            total += 1
+            rows.append((f.get("severity", "informational"), eng, f))
+    rows.sort(key=lambda r: (_SEV_ORDER.get(r[0], 99), r[1], r[2].get("id", "")))
+
+    L = []
+    L.append("# Findings — index")
+    L.append("")
+    L.append("**Generated file — do not edit by hand.** Regenerate with:")
+    L.append("")
+    L.append("```")
+    L.append("python3 <framework>/utilities/findings/findings_store.py index")
+    L.append("```")
+    L.append("")
+    L.append("A pointer only. Findings live in their own engagement directories and are not "
+             "moved or copied here — this exists so you can see everything without walking "
+             "every engagement.")
+    L.append("")
+    L.append("Every finding is stored twice (primary + `.vault/`), read-only, hash-indexed. "
+             "Check integrity with `findings_store.py verify --engagement <name>`.")
+    L.append("")
+    L.append(f"**{total} finding(s) across {len([e for e, i in found if i])} engagement(s).**")
+    L.append("")
+
+    if damaged:
+        L.append("## ⛔ DAMAGED INDEXES — resolve before trusting this file")
+        L.append("")
+        for eng in damaged:
+            L.append(f"- `{eng}` — findings/INDEX.json is unreadable; findings may exist "
+                     f"that are not listed below.")
+        L.append("")
+
+    if rows:
+        L.append("## All findings, most severe first")
+        L.append("")
+        L.append("| Sev | Status | Engagement | ID | Title | File |")
+        L.append("|---|---|---|---|---|---|")
+        for sev, eng, f in rows:
+            path = os.path.join(root, eng, "findings", f["file"])
+            title = f.get("title", "").replace("|", "\\|")
+            L.append(f"| {sev} | {f.get('status','')} | `{eng}` | {f.get('id','')} | "
+                     f"{title} | `{path}` |")
+        L.append("")
+
+    L.append("## By engagement")
+    L.append("")
+    for eng, items in found:
+        d = os.path.join(root, eng, "findings")
+        if items is None:
+            L.append(f"### `{eng}`\n\n- ⛔ index unreadable — inspect `{d}` directly\n")
+            continue
+        L.append(f"### `{eng}`")
+        L.append("")
+        L.append(f"- directory: `{d}`")
+        L.append(f"- backup copies: `{os.path.join(d, '.vault')}`")
+        L.append(f"- journal: `{os.path.join(d, '.journal.log')}` (append-only)")
+        L.append("")
+        for f in sorted(items, key=lambda x: (_SEV_ORDER.get(x.get("severity"), 99),
+                                              x.get("id", ""))):
+            v = "" if f.get("version", 1) == 1 else f" (v{f['version']})"
+            L.append(f"  - **{f.get('id','')}{v}** · {f.get('severity','')} · "
+                     f"{f.get('status','')} — {f.get('title','')}")
+            L.append(f"    `{os.path.join(d, f['file'])}`")
+        L.append("")
+    return "\n".join(L) + "\n"
+
+
+def write_index(destinations=None, engagements_root=None):
+    """Write the roll-up to each private destination. Returns the paths written."""
+    body = build_index(engagements_root)
+    written = []
+    for root in (destinations or INDEX_DESTINATIONS):
+        if not os.path.isdir(root):
+            continue
+        _assert_private(root)                              # refuses published trees
+        dest = os.path.join(root, INDEX_FILENAME)
+        # Regenerated in place: this file is derived, so overwriting is correct here. The
+        # findings it points at remain write-once — nothing under findings/ is touched.
+        with open(dest, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        written.append(dest)
+    return written
+
+
 # --------------------------------------------------------------------------- CLI
 def _ask(prompt, default=None, allowed=None):
     while True:
@@ -420,6 +564,7 @@ def menu(eng):
         print("  3) Verify integrity (both copies + hashes)")
         print("  4) Show a finding")
         print("  5) Amend a finding (adds a version, never overwrites)")
+        print("  7) Regenerate the cross-engagement findings index")
         print("  6) Restore a damaged finding from the vault")
         print("  q) Quit")
         c = input("\nChoice: ").strip().lower()
@@ -437,6 +582,9 @@ def menu(eng):
                 body = _editor_body()
                 r = amend(eng, fid, body)
                 print(f"  added {r['file']} — the previous version is untouched")
+            elif c == "7":
+                for p_ in write_index():
+                    print(f"  wrote {p_}")
             elif c == "6":
                 fid = _ask("Finding id to restore")
                 print("  restored:", ", ".join(restore(eng, fid)))
@@ -451,7 +599,7 @@ def menu(eng):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Write-once storage for engagement findings.")
     ap.add_argument("action", nargs="?",
-                    choices=["new", "list", "verify", "show", "amend", "restore"])
+                    choices=["new", "list", "verify", "show", "amend", "restore", "index"])
     ap.add_argument("id", nargs="?")
     ap.add_argument("--engagement")
     ap.add_argument("--title")
@@ -492,6 +640,17 @@ def main(argv=None):
             r = amend(eng, a.id or _ask("Finding id"), body, a.title, a.severity,
                       a.asset, a.status)
             print(f"added {r['file']} — previous version untouched")
+            return 0
+        if a.action == "index":
+            paths_written = write_index()
+            if a.json:
+                print(json.dumps({"written": paths_written}, indent=2))
+            else:
+                print(f"findings index regenerated ({len(paths_written)} destination(s)):")
+                for p_ in paths_written:
+                    print(f"  {p_}")
+                if not paths_written:
+                    print("  (no private destination found — nothing written)")
             return 0
         if a.action == "restore":
             print("restored:", ", ".join(restore(eng, a.id or _ask("Finding id"))))
