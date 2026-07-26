@@ -382,6 +382,65 @@ class AutomationStanceError(Exception):
     """Raised when the program's own words forbid what the requested profile would allow."""
 
 
+class IdentificationHeaderError(Exception):
+    """Raised when the configured attribution header is not the one the program asks for."""
+
+
+# Every attribution-header spelling seen in the wild. They differ per program and per platform,
+# and the difference is one word.
+_HEADER_RE = re.compile(r"\bX-(?:HackerOne|Bug-?Bounty|Intigriti|BugBounty)[A-Za-z-]*", re.I)
+
+
+def detect_identification_header(engagement):
+    """Which attribution header does the captured program text actually ask for?
+
+    Returns {"found": [names...], "lines": [(file, line, text)...]}. Empty `found` means the
+    program data never names one — the compiler then trusts the config, because plenty of
+    programs state the header only on a page that was never captured.
+    """
+    lines = _program_data_lines(eng_dir(engagement))
+    if lines is None:
+        return {"found": [], "lines": []}
+    found, cites = {}, []
+    for rel, n, text in lines:
+        for m in _HEADER_RE.finditer(text):
+            name = m.group(0)
+            key = name.lower()
+            if key not in found:
+                found[key] = name
+                cites.append((rel, n, text[:200]))
+    return {"found": sorted(found.values()), "lines": cites}
+
+
+def _enforce_identification_header(engagement, cfg_header_name):
+    """Refuse a profile whose attribution header is not the one the program asks for.
+
+    WHY: one program's page asked for a header the compiled lock did not carry — the lock had
+    another platform's convention instead. Requests went out attributed, but under a header that
+    program does not look for, and the finding's method section stated the wrong one. The header
+    is a per-program value that differs by a single word between programs run in the same week
+    (`X-HackerOne-Research` / `X-HackerOne-Researcher` / `X-HackerOne-Handle` / `X-Bug-Bounty`),
+    which is precisely the kind of value that should not be held in anyone's head.
+
+    Silence is NOT an error here, unlike the automation stance. A program that never states a
+    header in its captured text has not contradicted the config, and refusing would punish
+    incomplete capture rather than a real mismatch.
+    """
+    det = detect_identification_header(engagement)
+    if not det["found"]:
+        return det
+    if any(h.lower() == (cfg_header_name or "").lower() for h in det["found"]):
+        return det
+    ev = "\n".join(f"    {f}:{n}  {t}" for f, n, t in det["lines"][:4])
+    raise IdentificationHeaderError(
+        f"{engagement}: the configured attribution header '{cfg_header_name}' does not match "
+        f"what the program asks for.\n\n"
+        f"  The program's text names: {', '.join(det['found'])}\n\n{ev}\n\n"
+        f"  Set the correct header in the config and re-run. Traffic sent under the wrong header "
+        f"is unattributed as far as the program is concerned, and any report claiming otherwise "
+        f"is claiming something untrue.")
+
+
 def _enforce_automation_stance(engagement, manual_only):
     """Refuse a scanner-enabled compile when the program prohibits automated scanners.
 
@@ -433,6 +492,7 @@ def compile_scope(engagement, cfg, update=False):
     # Before anything is written: does the program's own text permit what we're about to allow?
     # Raises AutomationStanceError and writes nothing if not.
     stance = _enforce_automation_stance(engagement, manual_only)
+    _enforce_identification_header(engagement, cfg["header"][0])
 
     approved, excluded = [], {}
     for t in load_tasks():
