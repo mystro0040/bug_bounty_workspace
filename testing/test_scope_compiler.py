@@ -24,6 +24,8 @@ import shutil
 import sys
 import tempfile
 
+import yaml
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE = os.path.dirname(HERE)
 COMPILER = os.path.join(WORKSPACE, "global", "scope", "scope_compiler.py")
@@ -59,11 +61,20 @@ BASE_CFG = {
 }
 
 
-def temp_engagement():
-    """A throwaway engagement inside the real ENG_ROOT so the compiler's own paths apply."""
+def temp_engagement(program_text="Program rules\n* Submit one vulnerability per report.\n"):
+    """A throwaway engagement inside the real ENG_ROOT so the compiler's own paths apply.
+
+    Ships a `_program-data/` directory by default. That is not scaffolding for its own sake:
+    the compiler refuses to build a profile for an engagement whose automation stance cannot be
+    established, so an engagement without captured program text is not a valid engagement. Pass
+    `program_text` to plant specific policy language.
+    """
     d = tempfile.mkdtemp(prefix="_scopetest-", dir=SC.ENG_ROOT)
     with open(os.path.join(d, "scope.md"), "w", encoding="utf-8") as fh:
         fh.write("# test scope\n" + ("in scope: app.example-target.com\n" * 30))
+    os.makedirs(os.path.join(d, "_program-data"), exist_ok=True)
+    with open(os.path.join(d, "_program-data", "info.txt"), "w", encoding="utf-8") as fh:
+        fh.write(program_text)
     return os.path.basename(d), d
 
 
@@ -241,10 +252,119 @@ def test_caching():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_automation_stance_is_read_from_the_program_not_the_config():
+    """The compiler must not take the caller's word for whether scanners are allowed.
+
+    A program page said it could not accept submissions found by using automatic scanners. That
+    sentence sat in the captured program data and never reached scope.md, so the compiled lock
+    allowed sqlmap, nuclei, ffuf, feroxbuster, katana, gobuster, dalfox and amass. A sibling
+    engagement carried the identical sentence and enforced it correctly. The difference was which
+    session compiled it — which means it was enforced by memory, not by code.
+    """
+    print("[automation] a program that bans scanners cannot be compiled scanner-enabled")
+    BANS = ("Program rules\n"
+            "* Please do not use automatic scanners - be creative and do it yourself!\n"
+            "* We cannot accept any submissions found by using automatic scanners.\n")
+
+    # 1. The real defect: banned program + scanner-enabled request.
+    name, d = temp_engagement(program_text=BANS)
+    try:
+        try:
+            SC.compile_scope(name, dict(BASE_CFG))
+            chk("REFUSES a scanner profile on a scanner-banning program", False, "it compiled")
+        except SC.AutomationStanceError as exc:
+            chk("REFUSES a scanner profile on a scanner-banning program", True)
+            chk("the refusal quotes the program's own words",
+                "automatic scanners" in str(exc), str(exc)[:200])
+        chk("nothing was written on refusal",
+            not os.path.isfile(os.path.join(d, "approved_TTPs.yaml")))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # 2. Same program, manual_only requested — permitted, and the evidence is recorded.
+    name, d = temp_engagement(program_text=BANS)
+    try:
+        cfg = dict(BASE_CFG); cfg["manual_only"] = True
+        res = SC.compile_scope(name, cfg)
+        chk("the same program compiles fine as manual-only", res.get("cached") is False, res)
+        prof = yaml.safe_load(open(os.path.join(d, "approved_TTPs.yaml"), encoding="utf-8"))
+        ev = prof["operational_constraints"]["automation_evidence"]
+        chk("the lock records WHY it is manual-only",
+            ev["verdict"] == "prohibited_by_program", ev)
+        chk("the lock cites the source line", any("automatic scanners" in l
+            for l in ev["prohibition_lines"]), ev["prohibition_lines"])
+        lock = json.load(open(os.path.join(d, ".scope_lock", "enforcement.json")))
+        leaked = SC.SCANNERS & set(lock["allowed_binaries"])
+        chk("no scanner reaches the enforcement lock", not leaked, sorted(leaked))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # 3. Negative control — a program that says nothing about scanners is NOT blocked.
+    #    Without this, the test passes just as well if the gate refuses everything.
+    name, d = temp_engagement()
+    try:
+        res = SC.compile_scope(name, dict(BASE_CFG))
+        chk("a silent program is NOT blocked", res.get("cached") is False, res)
+        prof = yaml.safe_load(open(os.path.join(d, "approved_TTPs.yaml"), encoding="utf-8"))
+        chk("and is recorded as verified-permitted",
+            prof["operational_constraints"]["automation_evidence"]["verdict"]
+            == "verified_permitted")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # 4. Unverifiable must not read as fine. An engagement with no captured program text has no
+    #    establishable stance, and silence is the failure mode this whole gate exists to stop.
+    d = tempfile.mkdtemp(prefix="_scopetest-", dir=SC.ENG_ROOT)
+    try:
+        with open(os.path.join(d, "scope.md"), "w", encoding="utf-8") as fh:
+            fh.write("# test scope\n" + ("in scope: app.example-target.com\n" * 30))
+        try:
+            SC.compile_scope(os.path.basename(d), dict(BASE_CFG))
+            chk("REFUSES when there is no program text to check against", False, "it compiled")
+        except SC.AutomationStanceError:
+            chk("REFUSES when there is no program text to check against", True)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_automation_stance_is_not_derived_from_the_lock():
+    """Derive manual-only from the program rules, never from the compiled lock.
+
+    A previous attempt inferred it from the lock's deny-list and wrongly stripped 23 scanner TTPs
+    from a program that explicitly permits automated scanning. The lock is downstream
+    of the decision; reading it to decide what the lock should say is circular, and the error is
+    silent — an over-restricted profile still compiles and still looks correct.
+    """
+    print("[automation] the stance comes from program text, not from a prior lock")
+    name, d = temp_engagement(
+        program_text="Program rules\n* Automated scanning is permitted at <= 5 req/s.\n")
+    try:
+        # Compile manual-only first, so a deny-list full of scanners exists on disk.
+        cfg = dict(BASE_CFG); cfg["manual_only"] = True
+        SC.compile_scope(name, cfg)
+        lock = json.load(open(os.path.join(d, ".scope_lock", "enforcement.json")))
+        chk("setup: the first lock does deny scanners",
+            any("nuclei" in p for p in lock["denied_patterns"]))
+
+        # Now recompile WITHOUT manual_only. If the stance were read from the lock, this would
+        # be refused or silently stay manual-only. It must not be.
+        res = SC.compile_scope(name, dict(BASE_CFG), update=True)
+        chk("a prior manual-only lock does not force the next compile", res["manual_only"] is False,
+            res)
+        lock2 = json.load(open(os.path.join(d, ".scope_lock", "enforcement.json")))
+        chk("scanners are restored for a program that permits them",
+            bool(SC.SCANNERS & set(lock2["allowed_binaries"])),
+            sorted(SC.SCANNERS & set(lock2["allowed_binaries"])))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     for t in (test_pending_by_default, test_constraints_are_carried_not_asserted,
               test_every_tool_in_a_chain_is_flagged, test_self_check_does_not_cry_wolf,
               test_manual_only_excludes_scanners, test_permanent_constraints_always_present,
+              test_automation_stance_is_read_from_the_program_not_the_config,
+              test_automation_stance_is_not_derived_from_the_lock,
               test_approve_is_the_gate, test_caching):
         t()
     print(f"\n{_PASS}/{_PASS + _FAIL} passed")

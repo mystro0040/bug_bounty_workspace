@@ -266,6 +266,154 @@ def emit_commands(task, cfg):
 
 
 # ---------------------------------------------------------------- compile
+# ---------------------------------------------------------------- automation stance gate
+#
+# WHY THIS EXISTS
+#   A program page stated, verbatim, that it could not accept submissions found by using
+#   automatic scanners. That sentence sat in the captured program data the whole time and never
+#   reached `scope.md`, so the compiled lock allowed sqlmap, nuclei, ffuf, feroxbuster, katana,
+#   gobuster, dalfox and amass against a program that would have thrown out anything they found.
+#   A sibling engagement on the same platform carried the identical rule and enforced it
+#   correctly — same rule, two sessions, two outcomes.
+#
+#   `manual_only` was, and still is, a value the caller supplies. Nothing checked it against what
+#   the program actually said. That is a rule enforced by whoever remembered it, which is not
+#   enforcement. This gate reads the captured program text — the source of truth — and refuses to
+#   compile a scanner-enabled profile for a program whose own words forbid it.
+#
+#   Deliberately derived from the PROGRAM DATA, never from the compiled lock. A previous attempt
+#   inferred manual-only from the lock's deny-list and wrongly stripped 23 scanner TTPs from a
+#   program that explicitly permits automated scanning at a stated rate. The lock is downstream;
+#   reading it to decide what the lock should say is circular.
+
+# Unambiguous prohibitions. A hit here refuses the compile unless manual_only is set.
+_AUTOMATION_BANNED = [
+    r"do\s*(?:not|n't)\s+use\s+(?:any\s+)?automat(?:ed|ic)",
+    r"cannot\s+accept\s+any\s+submissions?\s+found\s+by\s+using\s+automat(?:ed|ic)",
+    r"automat(?:ed|ic)\s+(?:scanning|scanners?|tools?|testing)\s+is\s+(?:not\s+permitted|not\s+allowed|prohibited|forbidden)",
+    r"(?:no|never\s+use)\s+automat(?:ed|ic)\s+scanners?",
+    r"scanners?\s+are\s+(?:not\s+permitted|not\s+allowed|prohibited|forbidden)",
+    r"prohibited[^.\n]{0,60}automat(?:ed|ic)\s+(?:scanning|scanners?)",
+    r"automat(?:ed|ic)\s+scanners?[^.\n]{0,40}(?:prohibited|forbidden|not\s+allowed)",
+]
+
+# Mentions automation in a way that might matter but isn't a ban — e.g. "reports from automated
+# scanners will be closed as Not Applicable", which restricts what counts as EVIDENCE,
+# not whether you may run the tool. Surfaced loudly and recorded; never blocking, because treating
+# every scanner mention as a ban would make the gate something operators learn to override.
+_AUTOMATION_REVIEW = [
+    r"automat(?:ed|ic)\s+scanners?",
+    r"automat(?:ed|ic)\s+(?:scanning|tooling|testing)",
+    r"\bscanners?\b",
+]
+
+_SKIP_EXT = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".zip", ".pdf",
+             ".woff", ".woff2", ".css", ".js", ".xlsx"}
+
+
+# Where captured program policy lives. Both spellings are in use — engagements set up from the
+# vault get `_program-data/`, older ones use `program/`. Scan whichever exist
+# rather than standardising them: renaming a closed engagement's directory to satisfy a checker
+# is the checker bending the record, which is backwards.
+_PROGRAM_DATA_DIRS = ("_program-data", "program")
+
+
+def _program_data_lines(d):
+    """Every readable line of captured program text, as (relative path, line no, text).
+
+    Returns None when no program-data directory exists at all — distinct from an empty list,
+    which means the directory exists but held nothing readable. The caller treats the two
+    differently, and must.
+
+    Saved-webpage furniture is skipped — it carries no program rules, and letting a minified
+    bundle into the scan produces noise that buries a real hit.
+    """
+    roots = [os.path.join(d, name) for name in _PROGRAM_DATA_DIRS
+             if os.path.isdir(os.path.join(d, name))]
+    if not roots:
+        return None
+    out = []
+    for root in roots:
+        out.extend(_scan_root(root))
+    return out
+
+
+def _scan_root(root):
+    out = []
+    for dirpath, _, filenames in os.walk(root):
+        for fn in sorted(filenames):
+            if os.path.splitext(fn)[1].lower() in _SKIP_EXT or "_files" in dirpath:
+                continue
+            fp = os.path.join(dirpath, fn)
+            try:
+                if os.path.getsize(fp) > 4_000_000:      # a page dump, not a rules file
+                    continue
+                with open(fp, encoding="utf-8", errors="replace") as fh:
+                    for n, line in enumerate(fh, 1):
+                        line = line.strip()
+                        if line:
+                            out.append((os.path.relpath(fp, root), n, line))
+            except OSError:
+                continue
+    return out
+
+
+def detect_automation_stance(engagement):
+    """Read the captured program text and report what it says about automated tooling.
+
+    Returns {"verdict": "banned"|"unclear"|"no_program_data",
+             "banned": [(file, line, text), ...], "review": [...]}
+    """
+    lines = _program_data_lines(eng_dir(engagement))
+    if lines is None:
+        return {"verdict": "no_program_data", "banned": [], "review": []}
+
+    banned, review = [], []
+    for rel, n, text in lines:
+        low = text.lower()
+        if any(re.search(p, low) for p in _AUTOMATION_BANNED):
+            banned.append((rel, n, text[:300]))
+        elif any(re.search(p, low) for p in _AUTOMATION_REVIEW):
+            review.append((rel, n, text[:300]))
+    return {"verdict": "banned" if banned else "unclear", "banned": banned, "review": review}
+
+
+class AutomationStanceError(Exception):
+    """Raised when the program's own words forbid what the requested profile would allow."""
+
+
+def _enforce_automation_stance(engagement, manual_only):
+    """Refuse a scanner-enabled compile when the program prohibits automated scanners.
+
+    Two refusals, both fail-closed:
+      * the program text bans scanners and manual_only was not requested;
+      * there is no captured program text at all, so the stance cannot be established.
+    The second matters as much as the first — "I couldn't check" must not read the same as
+    "I checked and it was fine."
+    """
+    stance = detect_automation_stance(engagement)
+
+    if stance["verdict"] == "no_program_data":
+        raise AutomationStanceError(
+            f"cannot establish the automation stance for {engagement}: no _program-data/ "
+            f"directory, so there is nothing to check the program's rules against.\n"
+            f"Copy the captured program pages into {eng_dir(engagement)}/_program-data/ and "
+            f"re-run. Refusing to compile a profile whose scanner permissions cannot be "
+            f"verified against the program's own words.")
+
+    if stance["verdict"] == "banned" and not manual_only:
+        ev = "\n".join(f"    {f}:{n}  {t}" for f, n, t in stance["banned"][:5])
+        raise AutomationStanceError(
+            f"{engagement} PROHIBITS automated scanners, but this compile requested a "
+            f"scanner-enabled profile (manual_only=false).\n\n"
+            f"  The program's own words:\n{ev}\n\n"
+            f"  Set manual_only: true in the config and re-run. If you believe this is a false "
+            f"match, do not weaken the pattern — read the source line above, decide, and record "
+            f"the decision in scope.md so the next session inherits it.")
+
+    return stance
+
+
 def compile_scope(engagement, cfg, update=False):
     d = eng_dir(engagement)
     scope_file = find_scope_file(d)
@@ -281,6 +429,10 @@ def compile_scope(engagement, cfg, update=False):
     caps = set(cfg.get("capabilities", ["web", "api", "dns"]))
     manual_only = cfg.get("manual_only", False)
     rate = cfg["rate_value"]
+
+    # Before anything is written: does the program's own text permit what we're about to allow?
+    # Raises AutomationStanceError and writes nothing if not.
+    stance = _enforce_automation_stance(engagement, manual_only)
 
     approved, excluded = [], {}
     for t in load_tasks():
@@ -321,6 +473,17 @@ def compile_scope(engagement, cfg, update=False):
             "dos": "banned",
             "rate_limit": cfg["rate_limit"],
             "automation": "manual_only" if manual_only else "rate_limited",
+            # What the program text actually said, and where. Recorded so a later session can
+            # audit the decision instead of re-deriving it — the drift this whole gate exists
+            # to prevent. "verified_permitted" means the scan found no prohibition; it is not a
+            # claim that a human read the policy.
+            "automation_evidence": {
+                "verdict": "prohibited_by_program" if stance["verdict"] == "banned"
+                           else "verified_permitted",
+                "checked_against": "_program-data/",
+                "prohibition_lines": [f"{f}:{n}  {t}" for f, n, t in stance["banned"]],
+                "mentions_for_review": [f"{f}:{n}  {t}" for f, n, t in stance["review"][:10]],
+            },
             "identification_header": {"name": hname, "value": hvalue},
         },
         "curation": {"included": len(approved),
@@ -344,6 +507,7 @@ def compile_scope(engagement, cfg, update=False):
     return {"engagement": engagement, "cached": False, "ttps": len(approved),
             "excluded": profile["curation"]["excluded"], "binaries": len(allowed),
             "denied_patterns": len(denied), "manual_only": manual_only,
+            "automation_review": [f"{f}:{n}  {t}" for f, n, t in stance["review"][:10]],
             "self_check": "PASS" if not problems else problems}
 
 
