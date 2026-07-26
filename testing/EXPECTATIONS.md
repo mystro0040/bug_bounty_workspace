@@ -4,6 +4,13 @@ Regenerate with `workspace.py test --write-expectations`. This lists the suites 
 
 > **Directive:** Tests are a REGRESSION FLOOR, not a substitute for exercising the real tool. When you change or upgrade a tool you MUST do BOTH: (1) drive the actual application to confirm the change works, and (2) run AND update its suite here. Green tests on unchanged code prove nothing about code you just changed. Never skip the live app because tests pass; never skip updating tests because the app works.
 
+## scope-compiler  ·  safety  ·  CRITICAL
+
+- **Run:** `python3 test_scope_compiler.py` (from this directory)
+- **Expected:** exit 0, all checks pass. Scope generation: a compiled profile is PENDING and enforces nothing until approved; the rate limit and identification header are attached to the sub-command they govern rather than merely present in the string; every tool in a chained command is attributed, not just the first; manual-only programs cannot run a scanner; approve refuses broken artifacts and never sets the engagement active. ~40 checks.
+- **Covers:** global/scope/scope_compiler.py, .claude/skills/generate-scope/SKILL.md
+- **Isolation:** isolated (temp dirs, no writes to tracked files).
+
 ## scope-wall  ·  safety  ·  CRITICAL
 
 - **Run:** `python3 test_scope_wall.py` (from this directory)
