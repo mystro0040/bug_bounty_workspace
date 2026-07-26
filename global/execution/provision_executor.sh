@@ -34,9 +34,8 @@ mkdir -p "$BIN" "$(dirname "$LOG")"
 # interactsh-client is the OAST callback listener. Without it, BLIND vulnerability classes
 # cannot be proven at all — you can send a payload and see the direct response, but you cannot
 # observe an out-of-band callback, so blind SSRF, blind XXE and blind command injection stay
-# UNTESTED rather than clean. That gap closed out a whole class on a live engagement
-# (remitly, 2026-07-22: "SSRF PARKED — interactsh-client not installed"), and a class marked
-# parked-for-tooling is a hole in coverage that no amount of retesting the other classes fills.
+# UNTESTED rather than clean. A class parked for missing tooling is a hole in coverage that
+# no amount of retesting the other classes fills.
 #
 # It talks only to the interactsh server (oast.pro and friends), never to the target, so it
 # generates no traffic against an engagement asset.
