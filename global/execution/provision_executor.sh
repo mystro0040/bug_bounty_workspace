@@ -31,7 +31,16 @@ mkdir -p "$BIN" "$(dirname "$LOG")"
 # Tools the bug-bounty workflow actually uses, minus anything that is not
 # offload-relevant. Deliberately EXCLUDED: masscan (mass scanning conflicts with the
 # rate discipline), any brute-force or DoS tooling, anything requiring root.
-PD_TOOLS="subfinder dnsx httpx nuclei katana naabu"      # ProjectDiscovery
+# interactsh-client is the OAST callback listener. Without it, BLIND vulnerability classes
+# cannot be proven at all — you can send a payload and see the direct response, but you cannot
+# observe an out-of-band callback, so blind SSRF, blind XXE and blind command injection stay
+# UNTESTED rather than clean. That gap closed out a whole class on a live engagement
+# (remitly, 2026-07-22: "SSRF PARKED — interactsh-client not installed"), and a class marked
+# parked-for-tooling is a hole in coverage that no amount of retesting the other classes fills.
+#
+# It talks only to the interactsh server (oast.pro and friends), never to the target, so it
+# generates no traffic against an engagement asset.
+PD_TOOLS="subfinder dnsx httpx nuclei katana naabu interactsh-client"   # ProjectDiscovery
 GO_TOOLS="github.com/tomnomnom/waybackurls@latest
 github.com/lc/gau/v2/cmd/gau@latest
 github.com/tomnomnom/assetfinder@latest
@@ -72,19 +81,27 @@ have unzip || sudo apt-get install -y -qq unzip >/dev/null 2>&1
 # --------------------------------------------------------------------- ProjectDiscovery
 # Official GitHub releases. Fetch → verify checksum → unzip → install. Never piped.
 install_pd() {
-  local tool="$1" ver url zip sums expected actual
-  ver="$(curl -fsSL "https://api.github.com/repos/projectdiscovery/${tool}/releases/latest" \
+  local tool="$1" ver url zip sums expected actual repo
+  # The REPO and the BINARY are not always the same name. interactsh-client ships from the
+  # `interactsh` repo, so deriving the repo from the binary name 404s the releases API and the
+  # tool is silently skipped with a WARN — which reads like an upstream hiccup rather than
+  # "this tool will never install". Map the exceptions explicitly.
+  case "$tool" in
+    interactsh-client|interactsh-server) repo="interactsh" ;;
+    *)                                   repo="$tool" ;;
+  esac
+  ver="$(curl -fsSL "https://api.github.com/repos/projectdiscovery/${repo}/releases/latest" \
         | grep -m1 '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')"
-  [ -n "$ver" ] || { log "WARN could not resolve latest version for $tool"; return 1; }
+  [ -n "$ver" ] || { log "WARN could not resolve latest version for $tool (repo: $repo)"; return 1; }
   zip="${tool}_${ver}_linux_amd64.zip"
-  url="https://github.com/projectdiscovery/${tool}/releases/download/v${ver}/${zip}"
+  url="https://github.com/projectdiscovery/${repo}/releases/download/v${ver}/${zip}"
 
   curl -fsSL -o "$TMP/$zip" "$url" || { log "WARN download failed: $tool"; return 1; }
 
   # Upstream publishes a checksums file — verify against it rather than trusting the download.
   sums="${tool}_${ver}_checksums.txt"
   if curl -fsSL -o "$TMP/$sums" \
-       "https://github.com/projectdiscovery/${tool}/releases/download/v${ver}/${sums}" 2>/dev/null; then
+       "https://github.com/projectdiscovery/${repo}/releases/download/v${ver}/${sums}" 2>/dev/null; then
     expected="$(grep " $zip\$" "$TMP/$sums" | cut -d' ' -f1)"
     actual="$(sha256sum "$TMP/$zip" | cut -d' ' -f1)"
     if [ -n "$expected" ] && [ "$expected" != "$actual" ]; then
