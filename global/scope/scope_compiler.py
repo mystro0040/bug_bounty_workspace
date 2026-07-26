@@ -283,8 +283,8 @@ def emit_commands(task, cfg):
 #
 #   Deliberately derived from the PROGRAM DATA, never from the compiled lock. A previous attempt
 #   inferred manual-only from the lock's deny-list and wrongly stripped 23 scanner TTPs from a
-#   program that explicitly permits automated scanning at a stated rate. The lock is downstream;
-#   reading it to decide what the lock should say is circular.
+#   program that explicitly permits automated scanning at a stated rate. The lock is downstream; reading it
+#   to decide what the lock should say is circular.
 
 # Unambiguous prohibitions. A hit here refuses the compile unless manual_only is set.
 _AUTOMATION_BANNED = [
@@ -532,13 +532,28 @@ def self_check(engagement):
     if missing:
         problems.append(f"binaries invoked by approved TTPs but not allow-listed: {sorted(missing)}")
 
-    if prof["operational_constraints"]["automation"] == "manual_only":
+    # Read defensively. A profile predating a schema change is missing keys, and an unhandled
+    # KeyError here reads to the caller as "the checker is broken" rather than "the profile is
+    # broken" — so nobody investigates, and the check is fail-open in effect. Three engagements
+    # crashed this way on `automation` before this was written; the missing field is now
+    # reported as the problem it is.
+    oc = prof.get("operational_constraints") or {}
+
+    if "automation" not in oc:
+        problems.append("operational_constraints.automation is missing — the profile predates the "
+                        "automation stance field and its scanner posture is unrecorded. Recompile "
+                        "to establish it against the program text.")
+    elif oc["automation"] == "manual_only":
         leaked = set(enf.get("allowed_binaries", [])) & SCANNERS
         if leaked:
             problems.append(f"manual-only program still allows scanners: {sorted(leaked)}")
 
     # constraints 3 and 4 must be visible IN the commands, which is the only thing carrying them
-    hname = prof["operational_constraints"]["identification_header"]["name"]
+    hdr = oc.get("identification_header") or {}
+    if not hdr.get("name"):
+        problems.append("operational_constraints.identification_header.name is missing — the "
+                        "attribution header cannot be checked against the commands.")
+    hname = hdr.get("name") or ""
     no_hdr, no_rate, misplaced = [], [], []
     for t in prof.get("approved_ttps", []):
         for c in (t.get("commands") or []):
@@ -571,7 +586,12 @@ def self_check(engagement):
         problems.append(f"{len(set(no_rate))} TTP(s) emit a command without a rate flag "
                         f"(constraint 3 unenforced)")
 
-    blob = json.dumps(prof)
+    # default=str because YAML silently parses an unquoted `2026-07-20` into a datetime.date,
+    # which json.dumps refuses. The scan below only needs the profile flattened to text to look
+    # for placeholder strings, so stringifying is exactly right — and without it the checker
+    # crashes on any profile whose scope file mentioned a bare date, which is the checker
+    # failing rather than the profile.
+    blob = json.dumps(prof, default=str)
     if "ASK_OPERATOR" in blob:
         problems.append("ASK_OPERATOR placeholder still present (handle or test accounts unset)")
     return problems
