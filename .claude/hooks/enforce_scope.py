@@ -450,6 +450,29 @@ def main():
 
     active_name, profile = load_profile(project_dir)
 
+    # ---- approval gate -------------------------------------------------------------------
+    # `/generate-scope` writes `approved: false` and the skill documents the consequence:
+    #
+    #   "The hook refuses everything against an unapproved profile, so generating one changes
+    #    nothing about what may run. That is why generation is safe for an agent to perform."
+    #
+    # That was false. The word "approved" appeared eleven times in this file — every one of them
+    # a comment or a deny-string, never a lookup. Reproduced 2026-07-26 against a synthetic
+    # profile with `approved: false`: `nuclei -u https://acme.example` was ALLOWED, while the
+    # asset wall and deny-list both fired correctly on their controls. So an agent running
+    # /generate-scope was arming the scope it had just written for itself, and the sentence that
+    # made that safe to delegate was describing code that did not exist.
+    #
+    # Unapproved is treated as Phase-1 lockdown rather than a blanket refusal: local setup work
+    # (reading scope files, listing directories) stays possible so an engagement can be prepared,
+    # and only offensive tooling is withheld. The deny-list stays live while unapproved — it can
+    # only ever subtract, so applying it early is free.
+    # `is True`, not `bool(...)`. JSON `"approved": "false"` is a non-empty string and therefore
+    # truthy — a hand-edited lock meant to be OFF would silently arm the wall, which is the same
+    # hole this gate exists to close. Only a real JSON `true` counts; anything else, including a
+    # missing key on a lock that predates this field, is unapproved.
+    approved = profile.get("approved") is True if profile else False
+
     safe = set(DEFAULT_SAFE)
     denied, allowed, assets = [], None, {}
     if profile is not None:
@@ -457,7 +480,11 @@ def main():
         assets = profile.get("assets") or {}
         safe |= set(profile.get("always_allowed_extra") or [])
         if profile.get("allowed_binaries") is not None:
-            allowed = set(profile.get("allowed_binaries") or [])
+            # An unapproved profile grants nothing. Leaving `allowed` as None puts the command
+            # through the same Phase-1 lockdown path as "no engagement loaded", which already
+            # exists and is already tested — rather than inventing a second refusal path that
+            # could drift from it.
+            allowed = set(profile.get("allowed_binaries") or []) if approved else None
 
     bins = candidate_binaries(command)
     if not bins:
@@ -480,6 +507,15 @@ def main():
             continue
         offensive_used = True
         if allowed is None:
+            # Two ways to land here, and the operator needs to know which — "no engagement" and
+            # "engagement loaded but not approved" have completely different next steps.
+            if profile is not None and not approved:
+                emit("deny", f"Phase 1 lockdown: engagement '{active_name}' has a compiled scope "
+                             f"but it is NOT APPROVED, so offensive tooling ('{b}') is blocked. "
+                             f"Review the profile and approve it:\n"
+                             f"  python3 global/scope/scope_compiler.py approve {active_name} "
+                             f"--by <operator>\n"
+                             f"Generating a scope does not arm it. That is the point.")
             emit("deny", "Phase 1 lockdown: no engagement is loaded with an approved scope, so "
                          f"offensive tooling ('{b}') is blocked. Run `/generate-scope "
                          "<engagement>` and approve it first.")

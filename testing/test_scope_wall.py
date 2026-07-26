@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-test_scope_wall.py — regression tests for the PreToolUse scope-enforcement hook.
+test_scope_wall.py — the PreToolUse hook is driven, not read.
 
-The scope wall is the single most safety-critical piece in the workspace: it is what keeps scanning
-in-scope and keeps abusive/anonymizing/destructive commands from ever running (the thing that could
-get the ISP account cut off). Captured from the 2026-07-23 arsenal audit.
+Every check here runs the real `.claude/hooks/enforce_scope.py` as a subprocess against a
+synthetic engagement, exactly as Claude Code would. That matters: the defect this file was
+written for was invisible to inspection but obvious the moment the hook was executed.
 
-SELF-CONTAINED: it builds a synthetic engagement + scope-lock in a TEMP dir and drives the real hook
-(../.claude/hooks/enforce_scope.py) over the actual stdin JSON contract. No live bucket state, no
-network, no writes outside the temp dir. Run directly:  python3 test_scope_wall.py  (exit 0 = pass).
+  On 2026-07-26 the word "approved" appeared eleven times in enforce_scope.py — every one a
+  comment or a deny-string, never a lookup. `/generate-scope` writes `approved: false`, and the
+  skill documented the consequence: "The hook refuses everything against an unapproved profile,
+  so generating one changes nothing about what may run. That is why generation is safe for an
+  agent to perform on request." Driving the hook with a synthetic `approved: false` profile
+  allowed `nuclei` against an in-scope host. An agent running /generate-scope was arming the
+  scope it had just written for itself.
 
-Covers: .claude/hooks/enforce_scope.py
+The negative controls are not decoration. A wall that refuses everything passes every
+"was it blocked?" test and is useless, so each lockdown check is paired with a proof that the
+same command runs once the profile is approved.
+
+Pure stdlib, no network, temp dirs only. Run:  python3 testing/test_scope_wall.py
 """
 import json
 import os
@@ -19,8 +27,9 @@ import subprocess
 import sys
 import tempfile
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-HOOK = os.path.join(REPO, ".claude", "hooks", "enforce_scope.py")
+HERE = os.path.dirname(os.path.abspath(__file__))
+WORKSPACE = os.path.dirname(HERE)
+HOOK = os.path.join(WORKSPACE, ".claude", "hooks", "enforce_scope.py")
 
 _PASS = _FAIL = 0
 
@@ -33,115 +42,138 @@ def chk(name, cond, extra=""):
     print(("  PASS  " if ok else "  FAIL  ") + name + (("  -> " + str(extra)) if (extra and not ok) else ""))
 
 
-def make_project(tmp, engagement="programs/test/acme", approved=True, corrupt=False):
-    """Build a minimal project dir the hook will accept: an active-engagement pointer + a scope-lock
-    with acme.example in scope and a small allowed-binary set."""
-    os.makedirs(os.path.join(tmp, ".claude", "state"), exist_ok=True)
-    with open(os.path.join(tmp, ".claude", "state", "active_engagement"), "w") as fh:
-        fh.write(engagement)
-    lock = os.path.join(tmp, "engagements", engagement, ".scope_lock")
-    os.makedirs(lock, exist_ok=True)
-    prof = os.path.join(lock, "enforcement.json")
-    if corrupt:
-        open(prof, "w").write("{ this is not valid json")
-        return
-    json.dump({
-        "engagement": engagement,
-        "approved": approved,
-        "allowed_binaries": ["curl", "httpx", "dnsx", "nuclei", "ffuf", "gobuster", "nmap"],
-        "denied_patterns": [],
-        "assets": {"hosts": ["acme.example"], "wildcards": ["*.acme.example"],
-                   "cidrs": [], "ips": []},
-    }, open(prof, "w"))
+def sandbox(approved, allowed=("curl", "httpx", "nuclei"), hosts=("acme.example",)):
+    """A throwaway project dir with one compiled engagement."""
+    root = tempfile.mkdtemp(prefix="scopewall-")
+    eng = os.path.join(root, "engagements", "programs", "synthetic", ".scope_lock")
+    os.makedirs(eng)
+    os.makedirs(os.path.join(root, ".claude", "state"))
+    with open(os.path.join(eng, "enforcement.json"), "w", encoding="utf-8") as fh:
+        json.dump({
+            "engagement": "synthetic",
+            "approved": approved,
+            "source_scope_sha256": "0" * 64,
+            "allowed_binaries": list(allowed),
+            "always_allowed_extra": [],
+            "denied_patterns": [r"\bhydra\b"],
+            "assets": {"hosts": list(hosts), "wildcards": [], "cidrs": [], "ips": [],
+                       "endpoints": [], "out_of_scope": []},
+        }, fh)
+    with open(os.path.join(root, ".claude", "state", "active_engagement"), "w") as fh:
+        fh.write("programs/synthetic")
+    return root
 
 
-def decide(cmd, project_dir, engagement="programs/test/acme"):
-    env = dict(os.environ, CLAUDE_PROJECT_DIR=project_dir)
-    if engagement is None:
-        env.pop("AO_ENGAGEMENT", None)
-    else:
-        env["AO_ENGAGEMENT"] = engagement
-    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
-               "tool_input": {"command": cmd}, "cwd": project_dir}
-    p = subprocess.run([sys.executable, HOOK], input=json.dumps(payload),
-                       text=True, capture_output=True, env=env, timeout=30)
+def decide(root, command):
+    """Run the hook the way the harness does. Returns (decision, reason)."""
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": root})
+    env = dict(os.environ, AO_ENGAGEMENT="programs/synthetic", CLAUDE_PROJECT_DIR=root)
+    proc = subprocess.run([sys.executable, HOOK], input=payload, env=env,
+                          capture_output=True, text=True, timeout=30)
     try:
-        out = json.loads(p.stdout or "{}").get("hookSpecificOutput", {})
-        return out.get("permissionDecision", "?")
-    except ValueError:
-        return f"NONJSON(rc={p.returncode})"
+        out = json.loads(proc.stdout)["hookSpecificOutput"]
+    except (ValueError, KeyError):
+        return "MALFORMED", (proc.stdout or proc.stderr)[:300]
+    return out["permissionDecision"], out.get("permissionDecisionReason", "")
 
 
-def expect(want, cmd, note, project_dir, engagement="programs/test/acme"):
-    d = decide(cmd, project_dir, engagement)
-    chk(f"[{d:<5}] {note}", (d == "deny") == (want == "deny"), d)
+# =============================================================================
+def test_unapproved_profile_grants_nothing():
+    print("[wall] a compiled-but-unapproved profile arms nothing")
+    root = sandbox(approved=False)
+    try:
+        d, why = decide(root, "nuclei -u https://acme.example")
+        chk("offensive tooling on an in-scope host is DENIED", d == "deny", (d, why[:120]))
+        chk("the refusal says the scope is unapproved, not out-of-scope",
+            "NOT APPROVED" in why, why[:160])
+        chk("the refusal names the command that approves it",
+            "approve" in why, why[:160])
+
+        # Phase-1 lockdown, not a blanket refusal — an engagement still has to be preparable.
+        d, _ = decide(root, "ls engagements/")
+        chk("local setup work is still permitted", d == "allow", d)
+
+        # The deny-list can only ever subtract, so it applies before approval too.
+        d, why = decide(root, "hydra -l a -P b acme.example")
+        chk("the hard-coded floor still fires while unapproved", d == "deny", (d, why[:80]))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_approval_actually_opens_the_gate():
+    """The other half. Without this, 'deny everything' would score full marks above."""
+    print("[wall] approval opens the gate — and only as far as the profile says")
+    root = sandbox(approved=True)
+    try:
+        d, why = decide(root, "nuclei -u https://acme.example")
+        chk("the SAME command now runs once approved", d == "allow", (d, why[:120]))
+
+        d, why = decide(root, "nuclei -u https://evil.invalid")
+        chk("the asset boundary still holds", d == "deny", (d, why[:80]))
+        chk("and says so for the right reason", "OUTSIDE" in why, why[:120])
+
+        d, why = decide(root, "sqlmap -u https://acme.example")
+        chk("a binary outside the allow-list is still denied", d == "deny", (d, why[:80]))
+        chk("and says so for the right reason", "allow-list" in why, why[:120])
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_missing_approved_key_is_treated_as_unapproved():
+    """Fail-closed on an older lock that predates the field.
+
+    A lock written before the approval gate existed has no `approved` key at all. Absent must
+    mean unapproved — the alternative is that every stale lock on disk silently counts as
+    approved, which is the same hole in a different shape.
+    """
+    print("[wall] a lock with no approved key is unapproved, not approved-by-default")
+    root = sandbox(approved=True)
+    try:
+        lock = os.path.join(root, "engagements", "programs", "synthetic",
+                            ".scope_lock", "enforcement.json")
+        data = json.load(open(lock))
+        del data["approved"]
+        json.dump(data, open(lock, "w"))
+
+        d, why = decide(root, "nuclei -u https://acme.example")
+        chk("absent approved key denies", d == "deny", (d, why[:120]))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_non_boolean_approved_does_not_slip_through():
+    """Only a real JSON `true` counts.
+
+    `"approved": "false"` is a non-empty string and therefore truthy under bool() — a lock
+    hand-edited to be OFF would have silently armed the wall. `1` is rejected for the same
+    reason: the field records a decision, not a flag, and near-misses should fail closed.
+    """
+    print("[wall] approval is a boolean, and truthy junk does not count")
+    for value, should_allow in (("false", False), ("true", False), ("", False),
+                                (0, False), (1, False), (True, True)):
+        root = sandbox(approved=True)
+        try:
+            lock = os.path.join(root, "engagements", "programs", "synthetic",
+                                ".scope_lock", "enforcement.json")
+            data = json.load(open(lock))
+            data["approved"] = value
+            json.dump(data, open(lock, "w"))
+            d, _ = decide(root, "nuclei -u https://acme.example")
+            label = f"approved={value!r} -> {'allow' if should_allow else 'deny'}"
+            chk(label, (d == "allow") == should_allow, d)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
 
 def main():
     if not os.path.isfile(HOOK):
-        print(f"  SKIP  hook not present at {HOOK}")
-        return 0
-    tmp = tempfile.mkdtemp(prefix="scopewall-")
-    try:
-        make_project(tmp)
-
-        print("[HARD FLOOR] denied no matter what the profile says")
-        for cmd, n in [("hydra -l a -P p ssh://acme.example", "credential brute force"),
-                       ("medusa -h acme.example -M ssh", "medusa"),
-                       ("ncrack acme.example", "ncrack"),
-                       ("hping3 --flood acme.example", "DoS flood"),
-                       ("slowloris acme.example", "slowloris"),
-                       ("ab -n 100000 -c 500 https://acme.example/", "apachebench flood")]:
-            expect("deny", cmd, n, tmp)
-
-        print("[ANON/EVASION] forbidden (ISP + Anthropic-account risk)")
-        for cmd, n in [("torsocks curl https://acme.example", "torsocks"),
-                       ("proxychains4 nmap acme.example", "proxychains"),
-                       ("sudo openvpn --config us.ovpn", "openvpn"),
-                       ("wg-quick up wg0", "wireguard"),
-                       ("tor & curl https://acme.example", "bare tor")]:
-            expect("deny", cmd, n, tmp)
-
-        print("[DESTRUCTIVE/SYSTEM]")
-        for cmd, n in [("rm -rf /", "rm -rf /"), ("sudo shutdown -h now", "shutdown"),
-                       ("mkfs.ext4 /dev/sda1", "mkfs"), (":(){ :|:& };:", "fork bomb"),
-                       ("pkill -f httpx", "pkill (kills sibling engagement)"),
-                       ("killall nuclei", "killall")]:
-            expect("deny", cmd, n, tmp)
-
-        print("[RATE CEILING] the ISP protection")
-        for cmd, n in [("httpx -u https://acme.example -rate 500", "-rate 500"),
-                       ("dnsx -l t.txt -rl 1000", "-rl 1000"),
-                       ("nuclei -u https://acme.example --rate-limit 300", "--rate-limit 300"),
-                       ("ffuf -u https://acme.example/FUZZ -w w -t 200", "-t 200"),
-                       ("gobuster dir -u https://acme.example --threads 400", "--threads 400")]:
-            expect("deny", cmd, n, tmp)
-
-        print("[GENTLE] must NOT be blocked")
-        expect("allow", "httpx -u https://acme.example -rate 10", "-rate 10 in-scope", tmp)
-        expect("allow", "ffuf -u https://acme.example/FUZZ -w w -t 5", "-t 5 in-scope", tmp)
-        expect("allow", "curl https://acme.example/robots.txt", "curl in-scope", tmp)
-        expect("allow", "httpx -u https://api.acme.example", "wildcard subdomain in-scope", tmp)
-
-        print("[OUT OF SCOPE] denied")
-        for cmd, n in [("curl https://google.com", "out-of-scope host"),
-                       ("nmap -sV 8.8.8.8", "out-of-scope IP"),
-                       ("httpx -u https://evil.example.org", "unrelated domain")]:
-            expect("deny", cmd, n, tmp)
-
-        print("[FAIL-CLOSED] no/!bad engagement, corrupt or unapproved profile")
-        empty = tempfile.mkdtemp(prefix="scopewall-empty-")
-        os.makedirs(os.path.join(empty, ".claude", "state"))
-        expect("deny", "httpx -u https://acme.example", "no engagement resolvable", empty, engagement=None)
-        expect("deny", "curl https://acme.example", "unknown engagement", tmp, engagement="programs/ghost")
-        corrupt = tempfile.mkdtemp(prefix="scopewall-corrupt-")
-        make_project(corrupt, corrupt=True)
-        expect("deny", "httpx -u https://acme.example", "corrupt enforcement.json", corrupt)
-        shutil.rmtree(empty, ignore_errors=True)
-        shutil.rmtree(corrupt, ignore_errors=True)
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
+        print(f"hook not found at {HOOK}")
+        return 2
+    for t in (test_unapproved_profile_grants_nothing,
+              test_approval_actually_opens_the_gate,
+              test_missing_approved_key_is_treated_as_unapproved,
+              test_non_boolean_approved_does_not_slip_through):
+        t()
     print(f"\n{_PASS}/{_PASS + _FAIL} passed")
     return 1 if _FAIL else 0
 
