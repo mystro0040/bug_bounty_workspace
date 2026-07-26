@@ -108,7 +108,17 @@ done
 if have go; then
   export GOBIN="$BIN"
   for pkg in $GO_TOOLS; do
-    name="$(basename "${pkg%@*}")"; [ "$name" = "gau" ] && name=gau
+    # Strip a trailing major-version segment before taking the basename. Go module paths carry
+    # /v2, /v3 etc, so a naive basename yields "v2" — the build then succeeds, the binary lands
+    # under its real name, and the script reports "WARN build failed" because it looked for a
+    # binary called v2. That happened to ffuf and gobuster on 2026-07-26: both installed fine and
+    # both were reported as failures. A false failure is less dangerous than a false success, but
+    # it still teaches you to ignore the log.
+    base="${pkg%@*}"
+    case "$(basename "$base")" in
+      v[0-9]|v[0-9][0-9]) base="$(dirname "$base")" ;;
+    esac
+    name="$(basename "$base")"
     if have "$name"; then log "SKIP $name (already present)"; continue; fi
     log "building $name from $pkg"
     if go install "$pkg" >/dev/null 2>&1 && [ -x "$BIN/$name" ]; then
