@@ -338,6 +338,26 @@ def pull(files, engagement, name=None, local_dir=None, purge=True, decrypt=True)
             out["purged"].extend(res["purged"])
             for bad in res["failed"]:
                 out["stranded"].append({"path": bad, "reason": "purge failed"})
+
+    # `pulled` is the TRANSPORT artifact — for an encrypted run that is the .cms, which is not
+    # readable and not what a caller wants to open. `files` is the answer to "what do I read now?":
+    # the decrypted plaintext where decryption happened, the pulled artifact otherwise.
+    # Without this, callers reach for `pulled`, hand a .cms to something expecting text, and either
+    # crash on a UnicodeDecodeError or — worse — silently count zero results and report an empty
+    # run as a successful one. That happened on 2026-07-25 on a live engagement: seven dispatches
+    # returned 640 subdomains and the driver reported 0.
+    # Only artifacts that are BOTH verified and readable qualify. An unopened .cms must never be
+    # handed back as a result — a caller that got one would be counting ciphertext as data.
+    plaintext = set(out["decrypted"])
+    verified = set(out["verified"])
+    out["files"] = []
+    for art in out["pulled"]:
+        if art.endswith(ENC_SUFFIX):
+            stem = art[:-len(ENC_SUFFIX)]
+            if stem in plaintext:
+                out["files"].append(stem)
+        elif art in verified:
+            out["files"].append(art)
     return out
 
 

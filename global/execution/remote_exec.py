@@ -199,6 +199,7 @@ def run_remote(command, engagement, name=None, pull=None, timeout=None, secure_p
 
         life = RD.pull(targets, engagement, name=e["name"], purge=True, decrypt=True)
         result["pulled"] = life["pulled"]
+        result["files"] = life["files"]        # what to actually open — see remote_data.pull()
         result["verified"] = life["verified"]
         result["decrypted"] = life["decrypted"]
         result["purged"] = life["purged"]
