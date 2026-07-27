@@ -58,7 +58,7 @@ def forbidden_terms(engagement):
 
     Hostnames and wildcards come from the compiled scope-lock — the same file the wall enforces —
     so this can never drift from the real asset list. Each hostname also contributes its
-    distinctive labels, because `windsurf` alone identifies `windsurf.com` just as well.
+    distinctive labels, because `acme` alone identifies `acme.com` just as well.
     """
     terms = set()
     d = os.path.join(ENG_ROOT, engagement)

@@ -174,5 +174,5 @@ Never pre-fill the verification sentence. It is theirs to make true.
 ## Numbering
 
 `01-`, `02-`, … in the order they are worked, not by severity. The slug describes the **bug
-class**, not the target — `01-dangling-dns-delegation`, not `01-windsurf-auth`. The directory
+class**, not the target — `01-dangling-dns-delegation`, not `01-acme-login`. The directory
 name itself has to survive being read over someone's shoulder.

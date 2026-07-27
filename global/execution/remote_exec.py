@@ -37,7 +37,7 @@ TWO SAFETY INVARIANTS, enforced here:
 Usage (only when settings.EXECUTE_MODE == "remote"):
     from execution.remote_exec import run_remote
     result = run_remote("dnsx -l cand.txt -r resolvers.txt -rl 6 -t 25 -o out.txt",
-                        engagement="programs/hackerone/bounty/remitly",
+                        engagement="programs/hackerone/bounty/example-program",
                         pull=["out.txt"])
 """
 import os

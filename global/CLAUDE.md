@@ -728,12 +728,12 @@ not a scope or safety failure. Do not re-run the same command unchanged: bound i
 You can work several engagements in parallel (e.g. long enum on one while active-testing another), each
 walled to its OWN scope-lock, by pinning a terminal's engagement with an env var before launch:
 ```
-AO_ENGAGEMENT=programs/hackerone/bounty/remitly     claude    # terminal A → Remitly ONLY
+AO_ENGAGEMENT=programs/hackerone/bounty/example-program     claude    # terminal A → Example-Program ONLY
 AO_ENGAGEMENT=programs/hackerone/no-bounty/epic-games claude   # terminal B → Epic ONLY
 ```
 The scope hook resolves `$AO_ENGAGEMENT` per session (falling back to the shared `active_engagement`
 pointer when unset). Isolation is real: terminal B's commands are gated to Epic's assets and **cannot
-touch Remitly's**, and vice-versa. Fail-closed: unset/invalid/missing scope-lock ⇒ locked.
+touch that engagement's**, and vice-versa. Fail-closed: unset/invalid/missing scope-lock ⇒ locked.
 - **Confirm at session start** which engagement you're pinned to (`echo $AO_ENGAGEMENT`) before testing.
 - **Separate sessions, never the same resumed hash in two terminals** (that corrupts the transcript).
 
