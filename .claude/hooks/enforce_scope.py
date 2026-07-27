@@ -143,6 +143,54 @@ def load_profile(project_dir):
         return name, {}
 
 
+# ---- program rate ceiling ------------------------------------------------------------------
+# Duplicated from scope_compiler._RATE_ALIASES rather than imported: this hook must run standalone
+# from a bare `python3 enforce_scope.py` with no package on the path. Keep the two in step — if a
+# tool gains a rate flag in the compiler, add it here too, or the wall silently stops covering it.
+#
+# A tool's short and long forms are the SAME option, so checking only one is how `-rate-limit 5 …
+# -rl 20` once got through with an effective rate of 20.
+_RATE_ALIASES = {
+    "dnsx":        ("-rate-limit", "-rl"),
+    "httpx":       ("-rate-limit", "-rl"),
+    "katana":      ("-rate-limit", "-rl"),
+    "subfinder":   ("-rate-limit", "-rl"),
+    "nuclei":      ("-rate-limit", "-rl"),
+    "naabu":       ("-rate",),
+    "ffuf":        ("-rate", "-rate-limit"),
+    "feroxbuster": ("--rate-limit",),
+    "arjun":       ("--rate-limit",),
+}
+
+# `--delay` is the INVERSE of a rate — a SMALLER number means FASTER. Comparing it against a
+# requests-per-second ceiling would be backwards, so these are deliberately NOT covered here.
+# Stated rather than silently omitted: a gap you can see is a gap someone can close.
+_DELAY_TOOLS = ("gobuster", "dalfox", "sqlmap")
+
+
+def rate_violation(command, ceiling):
+    """Return (binary, flag, value) for the first rate flag exceeding the program's ceiling.
+
+    Scans the WHOLE command, not just the first segment. A chained
+    `httpx -rl 5 … && nuclei -rl 80 …` must not pass because its first half is compliant — that
+    is exactly how a constraint ends up holding for part of a command and quietly not the rest.
+    """
+    if not ceiling or ceiling <= 0:
+        return None
+    for binary, aliases in _RATE_ALIASES.items():
+        if not re.search(rf"(^|[\s/`;&|]){re.escape(binary)}(\s|$)", command):
+            continue
+        for alias in aliases:
+            for m in re.finditer(rf"(?<![\w-]){re.escape(alias)}[\s=]+(\d+)", command):
+                try:
+                    value = int(m.group(1))
+                except ValueError:
+                    continue
+                if value > ceiling:
+                    return binary, alias, value
+    return None
+
+
 def extract_subcommands(cmd):
     inner = re.findall(r"\$\(([^()]*)\)", cmd)
     inner += re.findall(r"`([^`]*)`", cmd)
@@ -434,6 +482,28 @@ def main():
             continue
 
     project_dir = os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd") or os.getcwd()
+
+    # ---- PROGRAM RATE CEILING ------------------------------------------------------------
+    # Deliberately placed BEFORE the soft-boundary valve, alongside the hard floor.
+    #
+    # Lowering shields is the operator relaxing constraints WE chose. A program's rate limit is
+    # not ours to relax — it is a term we agreed to when we accepted the engagement, and exceeding
+    # it is abuse of a live production system regardless of what mode this workspace is in.
+    #
+    # Before this existed the ceiling lived only in scope_compiler._clamp_rates(), which rewrites
+    # rate flags in the compiled TTP templates. Library commands were clamped; anything typed by
+    # hand was not. Measured 2026-07-27 against a lock documenting 5 req/s: `-rl 50` allowed,
+    # `-rl 99` allowed, denied only at 150 by the hard DoS floor — up to 20x the program's stated
+    # limit. The protection covered the library, not the operator.
+    _, _ceiling_profile = load_profile(project_dir)
+    _ceiling = (_ceiling_profile or {}).get("rate_ceiling")
+    _hit = rate_violation(command, _ceiling)
+    if _hit:
+        _bin, _flag, _val = _hit
+        emit("deny", f"{_bin} '{_flag} {_val}' exceeds this engagement's rate ceiling of "
+                     f"{_ceiling} req/s. The program's stated limit is a term of the engagement, "
+                     f"not a workspace preference — it is enforced in every mode, including "
+                     f"soft-boundary. Lower the rate to {_ceiling} or below.")
 
     # Safety valve: if the operator has lowered shields in the config, defer to CLAUDE.md policy.
     if not read_hard_boundaries(project_dir):

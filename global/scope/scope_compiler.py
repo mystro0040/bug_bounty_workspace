@@ -618,6 +618,7 @@ def compile_scope(engagement, cfg, update=False):
     enforcement = {"engagement": os.path.basename(engagement), "approved": False,
                    "source_scope_sha256": sha, "allowed_binaries": allowed,
                    "always_allowed_extra": [], "denied_patterns": denied,
+                   "rate_ceiling": rate,
                    "assets": profile["assets"]}
     with open(os.path.join(d, ".scope_lock", "enforcement.json"), "w", encoding="utf-8") as fh:
         json.dump(enforcement, fh, indent=2)
