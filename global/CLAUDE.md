@@ -248,6 +248,81 @@ standard, expected testing.
 
 ---
 
+## 1C. Drive every finding toward IMPACT and a PoC — the gate is at REPORT time, not at TEST time
+
+**Read the two halves of this together. Either one alone gets it wrong.**
+
+### The problem this exists to stop
+
+A verified, accurate, well-written observation is not automatically a submittable report. On
+2026-07-27 a report was fully drafted, manually reproduced by the operator, and evidenced with four
+captures — then blocked by HackerOne's pre-submission review as a **Core Ineligible Finding**:
+*subdomain takeover without a full working proof of concept*. The report was honest about not having
+demonstrated claimability, and that honesty is exactly what disqualified it. Hours went into a
+submission whose outcome was decidable at the start.
+
+That is the waste this section prevents. Not the honesty — the honesty was right, and stays. What was
+missing was asking, **before** the write-up began, *"what will make this submittable, and do we have
+it?"*
+
+### The reporting gate
+
+Before drafting ANY report, answer these three in `NOTES.md`. If you cannot, it is not ready:
+
+1. **What is the demonstrated impact?** Not what an attacker *could* do if something else were also
+   true — what does the evidence in hand actually show. "If this name were claimable" is a
+   hypothetical; "this name is claimable, here is the file served from it" is impact.
+2. **Is a PoC required for this bug class, and do we have one?** Some classes are ineligible without
+   one by definition — subdomain takeover, SSRF, IDOR, open redirect, injection. For those, a PoC is
+   not a nice-to-have, it is the finding. Other classes (information disclosure, misconfiguration)
+   ARE the observation, and no exploitation step exists to add.
+3. **Is it excluded?** Check the program's exclusions AND the platform's core-ineligible list
+   **before** writing, not after. Missing headers, self-XSS, version disclosure, internal IP
+   disclosure, best-practice nits are routinely ineligible, and one program in this workspace lists
+   internal IP/domain leakage as explicitly ineligible.
+
+**Informational severity is fine. Ineligible is not.** A low or informational finding that a program
+will accept, triage, and close as resolved builds reputation and Signal. A finding the platform
+refuses to accept costs a report slot and moves Signal the wrong way. The distinction that matters is
+**submittable versus not**, never **high versus low**.
+
+**Where a PoC would require acting outside scope** — on a third party's systems, on infrastructure the
+program does not own — you do NOT perform it, and the finding does not become submittable by wishing.
+Park the decision (§2B), record what would be needed, and move on to work that can land. Never let
+"we need a PoC" become a reason to reach past the boundary.
+
+### What this directive must NOT do
+
+**It is a gate on WRITING REPORTS. It is not a gate on TESTING.** Testing stays wide open, and if this
+rule ever makes you narrow the hunt, you have misread it.
+
+- **Chase the speculative lead.** Most impact is found by following something that looked like
+  nothing. A hunch with no visible impact yet is exactly what you should be pulling on — that IS the
+  work of finding impact, not a distraction from it.
+- **Never skip a test because the outcome might be informational.** You cannot know what a thread
+  leads to before you pull it, and low + low frequently chains into payable. The 28-domain trust list
+  in this workspace looked like a nothing observation until the login page revealed a module named
+  `trusted-origin` sitting next to it.
+- **Never narrow enumeration or coverage.** §1B stands unchanged in full. Enumerate everything, test
+  every in-scope class to exhaustion, earn the word "clean."
+- **Record everything you find**, impact or not. `findings_store.py` is the record; the reporting gate
+  decides only what gets *submitted*. A finding held back is still written down, still verified, and
+  still available the moment something chains into it.
+
+The order is: **hunt without restraint → record everything → gate hard at the report.** Reversing that
+— gating the hunt — produces the exact opposite of what this directive is for, because you cannot find
+impact you refused to look for.
+
+### Practical consequence
+
+When a finding lands as observation-only, spend the next effort **on making it submittable** rather
+than on writing it up. Concretely: is there a chain that produces impact? An in-scope way to
+demonstrate the mechanism? A related endpoint where the same weakness IS exploitable? That effort is
+usually the difference between a report that gets closed and one that gets paid — and it is nearly
+always cheaper than drafting a report that cannot be filed.
+
+---
+
 ## 2. Initialization protocol (MANDATORY — do this FIRST, every session)
 
 > **HALT immediately upon initialization.** Before doing ANY recon, scanning, tooling,
