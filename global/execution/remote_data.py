@@ -82,9 +82,11 @@ def _executor(name=None):
 
 
 def _ssh(e):
-    return ["ssh", "-i", os.path.expanduser(e["ssh_key"]), "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15",
-            f"{e['user']}@{e['host']}"]
+    # Built by ssh_mux so the options are defined ONCE. Every helper here opens several
+    # connections per lifecycle; with multiplexing on they become channels on one session.
+    # See ssh_mux.py for what that does and — more importantly — what it does not touch.
+    from execution import ssh_mux
+    return ssh_mux.ssh_argv(e)
 
 
 def _run(cmd, **kw):
@@ -176,9 +178,9 @@ def setup_encryption(name=None, force=False):
 
     # push the PUBLIC cert only
     _remote(e, "mkdir -p ~/.config/offsec && chmod 700 ~/.config/offsec")
-    r = _run(["scp", "-i", os.path.expanduser(e["ssh_key"]), "-o", "BatchMode=yes",
-              "-o", "StrictHostKeyChecking=accept-new", PUB_CERT,
-              f"{e['user']}@{e['host']}:{REMOTE_CERT.replace('~/', '')}"])
+    from execution import ssh_mux
+    r = _run(ssh_mux.scp_argv(e) + [PUB_CERT,
+             f"{e['user']}@{e['host']}:{REMOTE_CERT.replace('~/', '')}"])
     if r.returncode != 0:
         # scp with a ~ destination is inconsistent across versions; fall back to a piped write
         with open(PUB_CERT, encoding="utf-8") as fh:
@@ -309,8 +311,8 @@ def push(files, engagement, name=None, remote_dir=None):
         lsha = _sha256_local(local)
         rpath = posixpath.join(wd, os.path.basename(local))
 
-        rs = _run(["rsync", "-az", "-e",
-                   f"ssh -i {os.path.expanduser(e['ssh_key'])} -o BatchMode=yes",
+        from execution import ssh_mux
+        rs = _run(["rsync", "-az", "-e", ssh_mux.rsync_e(e),
                    local, f"{e['user']}@{e['host']}:{rpath}"])
         if rs.returncode != 0:
             out["stranded"].append({"path": local, "reason": f"rsync failed: {rs.stderr[:120]}"})
@@ -355,7 +357,8 @@ def pull(files, engagement, name=None, local_dir=None, purge=True, decrypt=True)
 
         ledger_record(e["name"], engagement, rpath, "remote", sha256=rsha)
         dest = os.path.join(local_dir, posixpath.basename(rpath))
-        rs = _run(["rsync", "-az", "-e", f"ssh -i {os.path.expanduser(e['ssh_key'])} -o BatchMode=yes",
+        from execution import ssh_mux
+        rs = _run(["rsync", "-az", "-e", ssh_mux.rsync_e(e),
                    f"{e['user']}@{e['host']}:{rpath}", dest])
         if rs.returncode != 0 or not os.path.isfile(dest):
             out["stranded"].append({"path": rpath, "reason": f"rsync failed: {rs.stderr[:120]}"})
@@ -465,10 +468,15 @@ def status(name=None):
     except RemoteDataError as exc:
         return {"error": str(exc)}
     led = ledger_load()["artifacts"]
+    # "What is still open?" is part of "what is still running?" (§2F-STOP) — a held SSH
+    # master is a live connection to the executor, so it belongs in the status a stop reads.
+    from execution import ssh_mux
     return {
         "execute_mode": S.EXECUTE_MODE,
         "resolves_to": S.resolve_mode(),
         "executor": e["name"], "host": e["host"], "vendor": e.get("vendor"),
+        "ssh_multiplex": ssh_mux.enabled(),
+        "ssh_master_open": ssh_mux.is_open(e),
         "keypair_present": keypair_exists(),
         "private_key": PRIV_KEY if os.path.isfile(PRIV_KEY) else None,
         "ledger_total": len(led),
@@ -481,7 +489,8 @@ def status(name=None):
 def _main():
     ap = argparse.ArgumentParser(description="Remote engagement-data lifecycle.")
     ap.add_argument("action",
-                    choices=["status", "setup", "list", "sweep", "push", "pull", "purge"])
+                    choices=["status", "setup", "list", "sweep", "push", "pull", "purge",
+                             "disconnect"])
     ap.add_argument("--executor")
     ap.add_argument("--engagement")
     ap.add_argument("--files", nargs="*", default=[])
@@ -505,6 +514,12 @@ def _main():
             out = pull(a.files, a.engagement, name=a.executor, purge=not a.no_purge)
         elif a.action == "purge":
             out = purge_remote(a.files, name=a.executor)
+        elif a.action == "disconnect":
+            # §2F-STOP: a held-open SSH master is something still running on THIS machine.
+            # It self-reaps after SSH_CONTROL_PERSIST idle; this closes it now, so a stop
+            # can be verified rather than waited out.
+            from execution import ssh_mux
+            out = {"closed": ssh_mux.close_all(), "now": ssh_mux.status()}
     except (RemoteDataError, PermissionError) as exc:
         print(json.dumps({"error": str(exc)}, indent=2))
         return 1

@@ -25,12 +25,11 @@ STATUS_FILE = os.path.expanduser("~/Desktop/temp/REMOTE-BOX-STATUS.md")
 
 
 def _ssh(executor, remote_cmd):
-    key = os.path.expanduser(executor["ssh_key"])
-    dest = f"{executor['user']}@{executor['host']}"
-    r = subprocess.run(
-        ["ssh", "-i", key, "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
-         "-o", "StrictHostKeyChecking=accept-new", dest, remote_cmd],
-        capture_output=True, text=True)
+    # Same options as every other remote helper, from ssh_mux. A health check during a long
+    # run costs a channel on the existing session rather than a fresh handshake.
+    from execution import ssh_mux
+    r = subprocess.run(ssh_mux.ssh_argv(executor) + [remote_cmd],
+                       capture_output=True, text=True)
     return r.returncode, r.stdout, r.stderr
 
 

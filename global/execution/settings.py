@@ -179,6 +179,20 @@ if _os.path.isfile(_LOCAL_EXECUTORS):
     except (OSError, ValueError):
         pass
 
+# --- SSH connection reuse (transport only — see execution/ssh_mux.py) -------------------
+# One run_remote() call opened THIRTEEN separate SSH connections: push the input, run the
+# command, encrypt, pull, verify, purge. With multiplexing they share ONE authenticated
+# session as separate channels.
+#
+# This is a transport optimisation and nothing more. It does not touch the scope wall (which
+# runs before any connection is opened), the rate limits (which live in the command, not the
+# socket), the attribution header, or the source IP. A connection is not a request.
+SSH_MULTIPLEX = True                       # False = one fresh connection per operation, as before
+# How long an IDLE master lingers before closing itself. It only has to outlive the gap
+# between steps of one dispatch — seconds — so this is deliberately short: a stop (§2F-STOP)
+# should not leave a connection held open for long. `remote_data.py disconnect` closes it now.
+SSH_CONTROL_PERSIST = "60s"
+
 # Where the orchestrator (Claude) itself runs. Informational + a guard flag for the
 # move-to-cloud step. "home" now; will become a control-VPS later. WHEREVER it is,
 # its connection to Anthropic must be direct + clean (see hard rule below).

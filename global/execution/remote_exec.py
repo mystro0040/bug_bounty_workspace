@@ -169,11 +169,14 @@ def run_remote(command, engagement, name=None, pull=None, timeout=None, secure_p
             raise RemoteError(f"input upload failed verification: {up['stranded']}")
         pushed_inputs = up["pushed"]
 
-    key = os.path.expanduser(e["ssh_key"])
     dest = f"{e['user']}@{e['host']}"
     workdir = e.get("workdir", "~/run")
-    ssh_base = ["ssh", "-i", key, "-o", "BatchMode=yes",
-                "-o", "StrictHostKeyChecking=accept-new", dest]
+    # Built by ssh_mux (options defined in ONE place). With multiplexing on, the dispatch,
+    # the tool-inventory probe, and every push/encrypt/pull/purge step below share a single
+    # authenticated session instead of opening thirteen. Transport only: the scope check
+    # above has already run, and the rate limit and header live inside `command`.
+    from execution import ssh_mux
+    ssh_base = ssh_mux.ssh_argv(e)
 
     try:
         wrapped = f"mkdir -p {shlex.quote(workdir)} && cd {shlex.quote(workdir)} && "
@@ -230,7 +233,7 @@ def run_remote(command, engagement, name=None, pull=None, timeout=None, secure_p
                 os.makedirs(local_dir, exist_ok=True)
                 for f in pull:
                     src = f"{dest}:{workdir}/{f}"
-                    rs = subprocess.run(["rsync", "-az", "-e", f"ssh -i {key}", src, local_dir + "/"],
+                    rs = subprocess.run(["rsync", "-az", "-e", ssh_mux.rsync_e(e), src, local_dir + "/"],
                                         capture_output=True, text=True)
                     if rs.returncode == 0:
                         result["pulled"].append(os.path.join(local_dir, os.path.basename(f)))

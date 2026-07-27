@@ -785,6 +785,12 @@ When you pause, stop, close an engagement, or hand back to the operator, **clean
   run. Name-based killing is only ever acceptable when you have CONFIRMED you are the sole session
   (check with `pgrep -a` and compare against the PIDs you started). When in doubt, kill by PID only.
   If you cannot identify your own PIDs, say so and let the operator decide — do not guess with `pkill`.
+- **Close the held-open SSH connection to the executor.** Remote helpers reuse ONE SSH session
+  (`ControlMaster`, see `execution/ssh_mux.py`) instead of opening a new one per operation. That
+  master is a live authenticated channel held by a background `ssh` on THIS machine. It reaps
+  itself after `SSH_CONTROL_PERSIST` idle, but a stop should not be something you wait out:
+  `python3 <…>/execution/remote_data.py disconnect`. `remote_data.py status` reports
+  `ssh_master_open` so "is anything still open?" is answerable without logging in and guessing.
 - **Verify before you report "stopped/paused":** a quick `pgrep` for your tools returns empty.
 - **Then** write `_STATUS.md` (state + a resumable checkpoint). A pause is only clean when BOTH: no
   orphaned jobs remain AND the resume state is written.
