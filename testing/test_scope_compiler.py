@@ -20,6 +20,7 @@ Isolated: temp engagement dirs, no network. Run: python3 test_scope_compiler.py
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -255,9 +256,9 @@ def test_caching():
 def test_automation_stance_is_read_from_the_program_not_the_config():
     """The compiler must not take the caller's word for whether scanners are allowed.
 
-    A program page said it could not accept submissions found by using automatic scanners. That
-    sentence sat in the captured program data and never reached scope.md, so the compiled lock
-    allowed sqlmap, nuclei, ffuf, feroxbuster, katana, gobuster, dalfox and amass. A sibling
+    Exact's page says "We cannot accept any submissions found by using automatic scanners."
+    That sentence sat in _program-data/ and never reached scope.md, so the compiled lock allowed
+    sqlmap, nuclei, ffuf, feroxbuster, katana, gobuster, dalfox and amass. The sibling Intigriti
     engagement carried the identical sentence and enforced it correctly. The difference was which
     session compiled it — which means it was enforced by memory, not by code.
     """
@@ -331,7 +332,7 @@ def test_automation_stance_is_not_derived_from_the_lock():
     """Derive manual-only from the program rules, never from the compiled lock.
 
     A previous attempt inferred it from the lock's deny-list and wrongly stripped 23 scanner TTPs
-    from a program that explicitly permits automated scanning. The lock is downstream
+    from CLEAR, which explicitly permits automated scanning at <= 5 req/s. The lock is downstream
     of the decision; reading it to decide what the lock should say is circular, and the error is
     silent — an over-restricted profile still compiles and still looks correct.
     """
@@ -359,8 +360,79 @@ def test_automation_stance_is_not_derived_from_the_lock():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_program_rate_ceiling_beats_the_library():
+    """The program's rate limit must win over whatever the TTP library hardcoded.
+
+    It didn't, in two different ways, and both shipped:
+
+      dnsx  — RATE_FLAG is "-rate-limit"; the library line carried "-rl 20". The long form was
+              absent so the injector added "-rate-limit 5", producing
+              `dnsx -rate-limit 5 … -rl 20`. The LATER flag wins at the CLI, so the effective
+              rate was 20 under a profile documenting 5.
+      httpx — the line already had "-rate-limit 20", the injector saw a rate flag and skipped,
+              and 20 stood.
+
+    Thirty commands per engagement were running at 10–30 req/s against live programs. The
+    profile said 5 the whole time. Found by diffing the documented ceiling against the emitted
+    commands rather than by reading either.
+    """
+    print("[rate] the program ceiling is enforced in the command, not just documented")
+    cfg = dict(BASE_CFG); cfg["rate_value"] = 5
+
+    # 1. Every alias and spelling gets clamped, including the short forms.
+    for line, binary, flag in (
+            ('dnsx -d a.com -rl 20 -silent', 'dnsx', '-rl 20'),
+            ('httpx -l h.txt -rate-limit 20 -silent', 'httpx', '-rate-limit 20'),
+            ('katana -list t.txt -rate-limit 15', 'katana', '-rate-limit 15'),
+            ('nuclei -l t.txt -rl 30 -c 10', 'nuclei', '-rl 30'),
+            ('ffuf -u https://a/FUZZ -w w.txt -rate 30', 'ffuf', '-rate 30'),
+            ('ffuf -u https://a/FUZZ -w w.txt -rate-limit 30', 'ffuf', '-rate-limit 30'),
+            ('arjun -u https://a/e --rate-limit 20', 'arjun', '--rate-limit 20'),
+    ):
+        out = SC._inject_all(line, [binary], cfg)
+        rates = [int(m.group(1)) for m in re.finditer(r"--?(?:rate-limit|rate|rl)[\s=]+(\d+)", out)]
+        chk(f"{binary}: `{flag}` clamped to <= 5", rates and max(rates) <= 5, (rates, out))
+
+    # 2. No duplicate rate flag — the original bug produced two, and the later one won.
+    out = SC._inject_all('dnsx -d a.com -rl 20 -silent', ['dnsx'], cfg)
+    chk("no duplicate rate flag is emitted",
+        len(re.findall(r"--?(?:rate-limit|rl)[\s=]+\d+", out)) == 1, out)
+
+    # 3. A library value ALREADY gentler than the ceiling must not be raised to it.
+    out = SC._inject_all('dnsx -d a.com -rl 2 -silent', ['dnsx'], cfg)
+    chk("a gentler library rate is left alone, not raised", "-rl 2" in out, out)
+
+    # 4. --delay is a PAUSE, not a rate. Clamping it down would speed the tool UP.
+    for line, binary in (('gobuster dir -u https://a -w w.txt --delay 50ms', 'gobuster'),
+                         ('dalfox url https://a --delay 100', 'dalfox'),
+                         ('sqlmap -u https://a?x=1 --delay 2', 'sqlmap')):
+        out = SC._inject_all(line, [binary], cfg)
+        original = re.search(r"--delay\s+(\S+)", line).group(1)
+        chk(f"{binary}: --delay {original} is preserved, not clamped",
+            f"--delay {original}" in out, out)
+
+    # 5. A command with no rate flag still gets one.
+    out = SC._inject_all('httpx -l h.txt -silent', ['httpx'], cfg)
+    chk("a missing rate flag is injected", "-rate-limit 5" in out, out)
+
+    # 6. End to end: compile a real profile and assert nothing exceeds the ceiling. This is the
+    #    check that would have caught the original bug; the unit checks above only pin the fix.
+    name, d = temp_engagement()
+    try:
+        SC.compile_scope(name, cfg, update=True)
+        prof = yaml.safe_load(open(os.path.join(d, "approved_TTPs.yaml"), encoding="utf-8"))
+        over = [(t["id"], m.group(0))
+                for t in prof["approved_ttps"] for c in (t.get("commands") or [])
+                for m in re.finditer(r"--?(?:rate-limit|rate|rl)[\s=]+(\d+)", c)
+                if int(m.group(1)) > 5]
+        chk("NO emitted command exceeds the program ceiling", not over, over[:3])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     for t in (test_pending_by_default, test_constraints_are_carried_not_asserted,
+              test_program_rate_ceiling_beats_the_library,
               test_every_tool_in_a_chain_is_flagged, test_self_check_does_not_cry_wolf,
               test_manual_only_excludes_scanners, test_permanent_constraints_always_present,
               test_automation_stance_is_read_from_the_program_not_the_config,

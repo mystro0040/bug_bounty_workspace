@@ -221,17 +221,76 @@ def _inject_all(line, task_binaries, cfg):
                        if re.search(rf"(^|[\s/`]){re.escape(b)}\s", seg)), None)
         if not binary or binary in ("whois", "semgrep"):
             continue
+        # The program's ceiling must WIN over whatever the TTP library hardcoded. Two ways it
+        # used to lose, both found by comparing the documented limit to the emitted commands:
+        #
+        #   dnsx  — RATE_FLAG is "-rate-limit", the library line carried "-rl 20". "-rate-limit"
+        #           was absent, so we injected "-rate-limit 5" and produced
+        #           `dnsx -rate-limit 5 … -rl 20`. The LATER flag wins at the CLI, so the
+        #           effective rate was 20 while the profile documented 5.
+        #   httpx — the library line already carried "-rate-limit 20", so the check saw the flag
+        #           present and skipped entirely, leaving 20 untouched.
+        #
+        # Thirty commands across two engagements were running at 10–30 req/s under a profile that
+        # said 5. Rewrite every alias to min(library, program) instead: clamping down never
+        # exceeds the ceiling, and never raises a library value that was already gentler.
+        seg = _clamp_rates(seg, binary, rate)
         head = re.split(r"\s(?:\d?>>?|>)\s", seg)[0]
         additions = []
-        if binary in RATE_FLAG:
-            flag = RATE_FLAG[binary].format(r=rate)
-            if flag.split()[0] not in head:
-                additions += flag.split()
+        if binary in RATE_FLAG and not _has_rate_flag(head, binary):
+            additions += RATE_FLAG[binary].format(r=rate).split()
         if hname not in head:
             additions += ["-H", f'"{hname}: {hvalue}"']
-        if additions:
-            parts[idx] = _inject(seg, binary, additions)
+        parts[idx] = _inject(seg, binary, additions) if additions else seg
     return "".join(parts)
+
+
+# Every spelling of "rate limit" each tool accepts. A tool's short and long forms are the SAME
+# option, so checking only the long form is how `-rate-limit 5 … -rl 20` got emitted.
+_RATE_ALIASES = {
+    "dnsx":        ("-rate-limit", "-rl"),
+    "httpx":       ("-rate-limit", "-rl"),
+    "katana":      ("-rate-limit", "-rl"),
+    "subfinder":   ("-rate-limit", "-rl"),
+    "nuclei":      ("-rate-limit", "-rl"),
+    "naabu":       ("-rate",),
+    "ffuf":        ("-rate", "-rate-limit"),      # the library uses BOTH spellings
+    "feroxbuster": ("--rate-limit",),
+    "arjun":       ("--rate-limit",),
+    # Below: tools that throttle with a PAUSE, not a rate. Listed so the self-check recognises a
+    # throttled invocation, and excluded from clamping by _DELAY_TOOLS.
+    "gobuster":    ("--delay",),
+    "dalfox":      ("--delay",),
+    "sqlmap":      ("--delay",),
+}
+
+# `--delay 50ms` is the INVERSE of a rate: forcing it down to the rate ceiling would make the
+# tool run FASTER, which is the opposite of the intent. Clamp only flags whose number means
+# requests-per-second.
+#
+# This list is not guesswork — it came from scanning every rate-ish flag the TTP library actually
+# emits and diffing against this map. That audit found four gaps at once (arjun's --rate-limit,
+# ffuf's second spelling, and dalfox/sqlmap's --delay). Re-run it when the library changes:
+# grep the emitted commands for rate|rl|delay|throttle|qps and check each against this table.
+_DELAY_TOOLS = {"gobuster", "dalfox", "sqlmap"}
+_CLAMP_ALIASES = {k: v for k, v in _RATE_ALIASES.items() if k not in _DELAY_TOOLS}
+
+
+def _has_rate_flag(text, binary):
+    return any(re.search(rf"(?<![\w-]){re.escape(a)}(?=[\s=]|$)", text)
+               for a in _RATE_ALIASES.get(binary, ()))
+
+
+def _clamp_rates(segment, binary, ceiling):
+    """Force every requests-per-second flag in this segment to at most the program's ceiling."""
+    def repl(m):
+        try:
+            return f"{m.group(1)} {min(int(m.group(2)), ceiling)}"
+        except ValueError:
+            return m.group(0)
+    for alias in _CLAMP_ALIASES.get(binary, ()):
+        segment = re.sub(rf"(?<![\w-])({re.escape(alias)})[\s=]+(\d+)", repl, segment)
+    return segment
 
 
 def _inject(segment, binary, additions):
@@ -630,10 +689,14 @@ def self_check(engagement):
                 elif hname not in head:
                     misplaced.append(t["id"])          # present in the string, attached to nothing
             if binary in RATE_FLAG:
-                flag = RATE_FLAG[binary].format(r=1).split()[0]
-                if flag not in c:
+                # Accept ANY spelling the tool honours, not just the long form we happen to
+                # inject. `-rl 5` and `-rate-limit 5` are the same option; a check that only
+                # recognises one reports a correctly-limited command as unlimited, which teaches
+                # you to ignore the check. Same naivety the injector had — it is what let
+                # `-rate-limit 5 … -rl 20` ship.
+                if not _has_rate_flag(c, binary):
                     no_rate.append(t["id"])
-                elif flag not in head:
+                elif not _has_rate_flag(head, binary):
                     misplaced.append(t["id"])
     if misplaced:
         problems.append(f"{len(set(misplaced))} TTP(s) carry the header/rate flag AFTER a pipe or "
