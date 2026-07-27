@@ -177,7 +177,11 @@ def run_remote(command, engagement, name=None, pull=None, timeout=None, secure_p
 
     try:
         wrapped = f"mkdir -p {shlex.quote(workdir)} && cd {shlex.quote(workdir)} && "
-        to = timeout or S.UNATTENDED_TOOL_TIMEOUT
+        # str(): the signature invites a number of seconds and every caller writes one, but
+        # shlex.quote only accepts str and raised TypeError on an int — so passing a timeout
+        # at all crashed the dispatch before a packet was sent. `timeout` accepts a bare
+        # number (seconds) or a suffixed form like "2h", so a string round-trip is lossless.
+        to = str(timeout or S.UNATTENDED_TOOL_TIMEOUT)
         wrapped += f"timeout {shlex.quote(to)} bash -lc {shlex.quote(command)}"
 
         run = subprocess.run(ssh_base + [wrapped], capture_output=True, text=True)
