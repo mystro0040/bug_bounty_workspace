@@ -76,13 +76,37 @@ is worse than not having it.
 
 ### `public/EXPLAIN-listen.md`
 
-This is listened to, not read. The prompt at the top must forbid formatting explicitly — no
-markdown, headings, bullets, tables, code blocks, asterisks, backticks, URLs, or file paths.
-Anything that reads aloud as punctuation salad has to go.
+This is listened to, never read. It is text-to-speech input, and that one fact drives every rule
+below.
 
-Then plain spoken prose covering: how the thing normally works · what goes wrong · a
-physical-world analogy · why it matters · **what is proven versus what is only suspected** ·
-how it is fixed · where the pattern recurs elsewhere.
+**The prompt at the top is the important half.** Copy it verbatim from an existing explainer —
+it is tuned and it works. The rules it enforces:
+
+- **No formatting at all.** Not less of it, none. No markdown, headings, bullets, numbered lists,
+  tables, code blocks, bold, italics, asterisks, hashes, backticks, underscores, arrows, dashes
+  used as punctuation, parentheses, quotation marks around terms, URLs, or file paths. The reason
+  to state in the prompt: formatting either reads aloud as literal junk ("asterisk asterisk") or
+  is silently dropped and the sentence collapses. Either way it sounds stupid. A sentence that
+  needs a symbol to work has to be rewritten as words.
+- **Numbers, addresses and symbols spelled out as words** — "one hundred and twenty seven dot
+  zero dot zero dot one", "port four four three".
+- **Acronyms expanded on first use and then kept as words** — "domain name system", not the three
+  letters; "server side request forgery", not the initials.
+- **One narrator. No dialogue.** No second speaker, interviewer, character names, stage
+  directions, or sound effects. Continuous prose in ordinary paragraphs, calm and declarative —
+  a good instructor explaining something properly and not in a hurry.
+- **Terms explained in passing**, inside the sentence, never in a formal definition stop.
+- **No section numbering, and none announced.** A numbered framing is fine if it falls out
+  naturally; do not invent one.
+- Roughly eight to ten minutes spoken.
+
+**Write the body in that same register**, because the model mimics the source material. No em
+dashes, no parentheses, no rhetorical-question rhythm. If the draft is full of dashes, it will
+come back full of dashes.
+
+The arc: how the thing normally works · what goes wrong · a physical-world analogy · why it
+matters · **what is proven versus what is only suspected** · how it is fixed · where the pattern
+recurs elsewhere.
 
 The analogy is the part that makes it stick. Spend effort there.
 
