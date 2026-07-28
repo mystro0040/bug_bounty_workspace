@@ -569,7 +569,26 @@ def dest_allowed(dest, assets):
     for w in (assets.get("wildcards") or []):
         w = w.lower()
         base = w[2:] if w.startswith("*.") else w
-        if d == base or d.endswith("." + base):
+        # STRICT: `*.example.com` covers SUBDOMAINS, not the bare apex `example.com`.
+        #
+        # This used to read `if d == base or d.endswith("." + base)`, which quietly made every
+        # wildcard cover its own apex. That was more permissive than three separate things that
+        # all say otherwise:
+        #
+        #   * CLAUDE.md §1B — "A wildcard (*.example.com) -> SUBDOMAINS are in scope"
+        #   * Hard rule #1  — "When in doubt, it is out of scope"
+        #   * the scope files themselves — programs list bare hosts ALONGSIDE wildcards
+        #     (Epic has 13 explicit hosts next to 30 wildcards). Two notations are used because
+        #     they mean two different things; collapsing them discards the program's own wording.
+        #
+        # Measured 2026-07-28: 44 apexes across 5 engagements were reachable ONLY through this
+        # behaviour. None had actually been contacted, so the exposure was prospective — but the
+        # wall was authorising targets no program had listed.
+        #
+        # An apex IS in scope when the program lists it: it then appears in assets["hosts"] and is
+        # matched by the exact-host loop above. This does not remove anything a program granted;
+        # it stops inferring a grant that was never made.
+        if d.endswith("." + base):
             return True
     return False
 
@@ -733,11 +752,24 @@ def main():
     if offensive_used and assets_nonempty(assets):
         for dest in sorted(extract_destinations(command)):
             if not dest_allowed(dest, assets):
+                # A bare apex whose only coverage would be a wildcard is the single most likely
+                # honest mistake here, so name it specifically rather than leaving the operator
+                # to re-read the scope file wondering why an obviously-related host was refused.
+                apex_hint = ""
+                _bases = [(w[2:] if w.lower().startswith("*.") else w).lower()
+                          for w in (assets.get("wildcards") or [])]
+                if dest.lower() in _bases:
+                    apex_hint = (f" NOTE: '*.{dest}' IS in scope, but a wildcard covers SUBDOMAINS "
+                                 f"only — not the bare apex. Programs list an apex separately when "
+                                 f"they mean to include it (see the explicit host list in this "
+                                 f"engagement's scope). If the program does list '{dest}' itself, "
+                                 f"add it to the scope file's hosts and re-run "
+                                 f"`/generate-scope --update`; do not infer it from the wildcard.")
                 emit("deny", f"Target '{dest}' is OUTSIDE the approved asset scope for engagement "
                              f"'{active_name}'. Phase 2 asset boundary. Only in-scope hosts/IP "
                              "ranges from the approved profile may be targeted. If '" + dest +
                              "' is legitimately in scope, update the scope file and re-run "
-                             "`/generate-scope --update`.")
+                             "`/generate-scope --update`." + apex_hint)
         # Targets fed from a file / stdin are invisible on the command line — read & verify them
         # so `nmap -iL out.txt` / `httpx < list` can't slip past the asset wall.
         file_dests, unresolved = file_fed_targets(command, project_dir)
