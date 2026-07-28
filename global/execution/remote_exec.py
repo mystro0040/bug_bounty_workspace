@@ -79,7 +79,14 @@ def _scope_ok(command, engagement):
     payload = json.dumps({"tool_name": "Bash",
                           "tool_input": {"command": command},
                           "cwd": BUCKET})
-    env = dict(os.environ, AO_ENGAGEMENT=engagement or "")
+    # AO_REMOTE_DISPATCH tells the hook's LOCATION check that this bare command is a dispatcher
+    # pre-flight, not an agent about to run a scanner on the home line. We validate the unwrapped
+    # command deliberately — so the asset wall reads the real targets rather than an opaque ssh
+    # string — which makes this pre-flight indistinguishable from a local invocation without it.
+    # It travels in the hook's ENVIRONMENT, which the command being validated cannot reach: text
+    # inside `command` is data to the hook, never a variable in its process. See the location
+    # section of enforce_scope.py for why that separation is what makes the signal sound.
+    env = dict(os.environ, AO_ENGAGEMENT=engagement or "", AO_REMOTE_DISPATCH="1")
     r = subprocess.run([sys.executable, hook], input=payload,
                        capture_output=True, text=True, env=env)
     out = (r.stdout or "").strip()

@@ -191,6 +191,123 @@ def rate_violation(command, ceiling):
     return None
 
 
+# --------------------------------------------------------------------- execution location
+#
+# THE GAP THIS CLOSES (measured 2026-07-27, same shape as the rate-ceiling gap the night before):
+#
+#   The operator's rule is "no tools running on my home network" — stated as being the same tier
+#   as scope itself. The framework documented it in CLAUDE.md §2F-NET and remote_exec.py, in both
+#   cases as a RULE THE AGENT FOLLOWS: "nothing routes automatically; a tool you invoke through
+#   Bash runs HERE, on the home IP, no matter what the mode says."
+#
+#   Nothing enforced it. With an engagement resolving to `remote`, a hand-typed
+#   `httpx -u https://<in-scope-host> -rl 5` was ALLOWED by this wall — in-scope host, compliant
+#   rate — and would have run from the operator's residential line. The wall checked WHAT and HOW
+#   FAST. It never checked WHERE FROM.
+#
+#   That is the third time the same pattern has appeared: confident prose describing a protection
+#   that no code implements. Scope had a wall. Rate got one. Location now has one.
+#
+# HOW A LEGITIMATE REMOTE DISPATCH GETS THROUGH:
+#   remote_exec.run_remote() validates the BARE tool command against this hook before it builds the
+#   SSH invocation — deliberately, so offloading can never become a way around the asset wall. That
+#   means the dispatcher's own pre-flight check looks identical to an agent typing the command
+#   directly. It signals itself with AO_REMOTE_DISPATCH=1 in the hook's ENVIRONMENT.
+#
+#   Why an env var is sound here, stated plainly rather than assumed: this hook runs as a subprocess
+#   of the harness, so its environment is set by the harness and by run_remote — NOT by the command
+#   being validated. An agent writing `AO_REMOTE_DISPATCH=1 httpx ...` puts that text in the command
+#   STRING, which this hook reads as data; it does not become a variable in this process. Shell
+#   state does not persist between Bash calls either. It is a signal, not a cryptographic proof, and
+#   its integrity rests on that separation — which is why it is documented instead of quietly relied on.
+#
+# THE DELIBERATE OFF SWITCH:
+#   settings.EXECUTE_MODE = "local". That is a specific, typed statement that tools should run here,
+#   which is exactly the "unless I tell you otherwise, and I should be sure I'm telling you" the
+#   operator asked for. Lowering HARD_BOUNDARIES does NOT lift this, for the same reason it does not
+#   lift the rate ceiling: shields-down relaxes constraints we chose for ourselves, and this one is
+#   the operator's standing instruction about their own home network.
+
+_NETWORK_BINARIES = frozenset({
+    # active scanners / probers — these put packets on a target
+    "httpx", "dnsx", "nuclei", "ffuf", "feroxbuster", "gobuster", "naabu", "nmap", "masscan",
+    "katana", "sqlmap", "dalfox", "arjun", "wpscan", "gowitness", "interactsh-client", "puredns",
+    "massdns", "wfuzz", "dirb", "nikto", "testssl.sh", "sslscan", "hydra", "amass",
+    # passive / aggregator tools — these do NOT touch the target, they query third-party indexes.
+    # Included anyway because the operator's rule is about tools running on their home network, not
+    # only about target traffic, and a simple rule that matches what they said beats a clever one
+    # that needs a footnote. Same call as the rate ceiling. If it becomes annoying, removing these
+    # is a one-line change and a deliberate one.
+    "subfinder", "assetfinder", "gau", "waybackurls", "whois",
+    # general HTTP clients, only when actually aimed at something (see location_violation)
+    "curl", "wget",
+})
+
+# A command that STARTS with one of these is transport, not a local scan: it is how work reaches
+# the executor. The asset wall still inspects the destination, so this is not a bypass.
+_TRANSPORT_BINARIES = frozenset({"ssh", "scp", "rsync", "sftp"})
+
+
+def execution_is_remote(project_dir):
+    """True / False / None(unknown) — does execution resolve to a remote executor?
+
+    Read live from settings.py rather than frozen into the scope-lock, because the executor is a
+    machine-level fact that can change without recompiling any engagement. A stale copy in the lock
+    would be a second source of truth, and the wrong one.
+    """
+    exec_dir = os.path.join(project_dir, "global")
+    if not os.path.isdir(os.path.join(exec_dir, "execution")):
+        return None
+    saved = list(sys.path)
+    try:
+        sys.path.insert(0, exec_dir)
+        from execution import settings as _S      # noqa: PLC0415
+        return _S.resolve_mode() == "remote"
+    except Exception:                              # noqa: BLE001 — see comment in main()
+        return None
+    finally:
+        sys.path[:] = saved
+
+
+def location_violation(command, is_remote):
+    """Return the offending binary when a network tool would run HERE but should run on the executor.
+
+    Returns None when: execution is local or unknown, the dispatcher is calling, the command is a
+    transport invocation, or no network-facing binary is present.
+    """
+    if is_remote is not True:
+        return None
+    if os.environ.get("AO_REMOTE_DISPATCH") == "1":
+        return None
+
+    segs = [s.strip() for s in _segments(command) if s.strip()]
+    for seg in segs:
+        try:
+            toks = shlex.split(seg)
+        except ValueError:
+            toks = seg.split()
+        if not toks:
+            continue
+        # skip leading VAR=value assignments and `sudo`/`env` wrappers to find the real binary
+        idx = 0
+        while idx < len(toks) and (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", toks[idx])
+                                   or toks[idx] in ("sudo", "env", "nohup", "setsid")):
+            idx += 1
+        if idx >= len(toks):
+            continue
+        binary = os.path.basename(toks[idx])
+        if binary in _TRANSPORT_BINARIES:
+            return None                            # the whole command is a dispatch; let it through
+        if binary in _NETWORK_BINARIES:
+            # curl/wget are general-purpose; only flag them when aimed at a real remote destination,
+            # so reading a local file or hitting localhost is not swept up.
+            if binary in ("curl", "wget"):
+                if not re.search(r"https?://(?!localhost|127\.|\[::1\])", seg):
+                    continue
+            return binary
+    return None
+
+
 def extract_subcommands(cmd):
     inner = re.findall(r"\$\(([^()]*)\)", cmd)
     inner += re.findall(r"`([^`]*)`", cmd)
@@ -504,6 +621,23 @@ def main():
                      f"{_ceiling} req/s. The program's stated limit is a term of the engagement, "
                      f"not a workspace preference — it is enforced in every mode, including "
                      f"soft-boundary. Lower the rate to {_ceiling} or below.")
+
+    # ---- EXECUTION LOCATION --------------------------------------------------------------
+    # Also before the soft-boundary valve, for the same reason as the rate ceiling. "No tools
+    # running on my home network" is the operator's standing instruction about their own
+    # residential line — it is not one of the constraints shields-down exists to relax. The
+    # deliberate way to say otherwise is settings.EXECUTE_MODE = "local", which is specific and
+    # typed rather than a blanket switch.
+    _is_remote = execution_is_remote(project_dir)
+    _loc = location_violation(command, _is_remote)
+    if _loc:
+        emit("deny", f"'{_loc}' is a network-facing tool and execution for this workspace resolves "
+                     f"to REMOTE — so it must run ON the executor, not from this machine. Invoked "
+                     f"through Bash it would run HERE, putting the traffic on the operator's home "
+                     f"IP, which is the one thing the remote executor exists to prevent. Dispatch "
+                     f"it instead: remote_exec.run_remote(cmd, engagement=..., pull=[...]). If this "
+                     f"step genuinely has to run locally, that is a deliberate change to "
+                     f"settings.EXECUTE_MODE, not something to work around here.")
 
     # Safety valve: if the operator has lowered shields in the config, defer to CLAUDE.md policy.
     if not read_hard_boundaries(project_dir):
