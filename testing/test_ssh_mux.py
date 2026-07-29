@@ -180,7 +180,11 @@ def test_lifecycle_helpers_are_safe_without_a_box():
           ssh_mux.is_open(EXEC) is False)
     st = ssh_mux.status()
     check("status() returns a list", isinstance(st, list), repr(st)[:120])
-    check("close_all() returns a list, does not raise", isinstance(ssh_mux.close_all(), list))
+    r = ssh_mux.close_all()
+    check("close_all() returns a dict with the new contract",
+          isinstance(r, dict) and {"closed", "refused"} <= set(r), str(r)[:120])
+    check("other_clients() returns a list of pids, does not raise",
+          isinstance(ssh_mux.other_clients(), list))
 
 
 def test_settings_knobs_exist():
@@ -200,6 +204,40 @@ def test_cli_runs():
     check("names the state", "multiplexing" in r.stdout.lower(), r.stdout[:200])
 
 
+
+def test_close_all_refuses_while_others_are_using_it():
+    """REGRESSION 2026-07-28. A two-hour DNS brute-force lost 5,000 names because an ad-hoc probe
+    script finished and called close_all(). The `ssh -O exit` tore down the shared master and every
+    channel on it; the running job saw rc=255 on both chunks. Nothing was wrong with the job, the
+    targets, or the network — two things shared one connection and the one that finished first
+    tidied up after itself.
+
+    This is the module's own documented failure mode ("if the MASTER dies, every channel riding it
+    dies with it") reached by the most ordinary route imaginable, which is why it needed a guard
+    rather than a warning."""
+    print("\n[13] close_all() refuses to kill a connection other work is riding")
+    real = ssh_mux.other_clients
+    try:
+        ssh_mux.other_clients = lambda exclude_pid=None: [424242]
+        r = ssh_mux.close_all()
+        check("refused", r["closed"] == [] and r["refused"], str(r)[:140])
+        check("names the pids so it can be checked", 424242 in r["other_clients"], str(r))
+        check("explains the consequence rather than just saying no",
+              "in-flight" in r.get("reason", ""), r.get("reason", "")[:140])
+        check("says it self-closes anyway, so refusing is safe",
+              "self-closes" in r.get("reason", ""), r.get("reason", "")[:140])
+        forced = ssh_mux.close_all(force=True)
+        check("force=True is still available for a deliberate stop",
+              forced["refused"] == [], str(forced)[:120])
+    finally:
+        ssh_mux.other_clients = real
+
+
+def test_other_clients_excludes_self():
+    print("\n[14] other_clients() does not count the caller (or it would always refuse)")
+    check("this process is not in its own list", os.getpid() not in ssh_mux.other_clients())
+
+
 def main():
     print("=" * 78)
     print("test_ssh_mux — connection reuse, and everything it must not have broken")
@@ -209,7 +247,9 @@ def main():
                test_off_switch_reverts_exactly, test_no_proxy_or_origin_hiding_options,
                test_all_transports_agree, test_rsync_e_has_no_spaces_inside_a_token,
                test_callers_route_through_ssh_mux, test_lifecycle_helpers_are_safe_without_a_box,
-               test_settings_knobs_exist, test_cli_runs):
+               test_settings_knobs_exist, test_cli_runs,
+               test_close_all_refuses_while_others_are_using_it,
+               test_other_clients_excludes_self):
         fn()
     print("\n" + "=" * 78)
     print(f"{_PASS} passed, {_FAIL} failed")

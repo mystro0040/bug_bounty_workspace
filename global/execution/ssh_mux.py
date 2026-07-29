@@ -197,8 +197,60 @@ def close(executor):
         return False
 
 
-def close_all():
-    """Close every open master. Call this as part of a clean stop (§2F-STOP)."""
+def other_clients(exclude_pid=None):
+    """PIDs of OTHER processes currently riding the shared master.
+
+    The master is shared by every process on this machine. Counting who is attached is what makes
+    it safe to close — see close_all().
+
+    Identified from /proc rather than by parsing `ps`: a client is an ssh process whose command
+    line references the control socket directory and which is not itself the master (the master
+    carries "[mux]").
+    """
+    me = exclude_pid or os.getpid()
+    found = []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return found
+    for pid in pids:
+        if int(pid) in (me, os.getppid()):
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                cmd = fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+        except OSError:
+            continue
+        if SOCKET_DIR in cmd and "[mux]" not in cmd and cmd.strip().startswith(("ssh", "/usr/bin/ssh")):
+            found.append(int(pid))
+    return found
+
+
+def close_all(force=False):
+    """Close every open master. Part of a clean stop (§2F-STOP).
+
+    REFUSES BY DEFAULT WHEN OTHER WORK IS RIDING THE CONNECTION, and this is not caution for its
+    own sake — it happened. On 2026-07-28 a two-hour DNS brute-force lost 5,000 names because an
+    ad-hoc probe script finished and called close_all(); the `ssh -O exit` tore down the master and
+    every channel on it, and the running job saw rc=255 on both chunks. Nothing was wrong with the
+    job, the targets, or the network.
+
+    That is the failure mode this module's own docstring warns about — "if the MASTER connection
+    dies, every channel riding it dies with it" — reached by the most ordinary route imaginable:
+    two things using one connection, and the one that finished first tidying up after itself.
+
+    Returns {"closed": [...], "refused": [...], "other_clients": [pids]}.
+    """
+    others = other_clients()
+    if others and not force:
+        return {"closed": [], "refused": [e.get("name") for e in
+                                          (getattr(S, "REMOTE_EXECUTORS", []) or [])],
+                "other_clients": others,
+                "reason": (f"{len(others)} other process(es) are using the shared SSH connection "
+                           f"(pids {others}). Closing it would kill their in-flight commands. "
+                           f"Left open — it self-closes after {getattr(S, 'SSH_CONTROL_PERSIST', '60s')} "
+                           f"idle anyway. Pass force=True only when you have confirmed nothing "
+                           f"else is running.")}
     closed = []
     for e in getattr(S, "REMOTE_EXECUTORS", []) or []:
         try:
@@ -206,7 +258,7 @@ def close_all():
                 closed.append(e.get("name"))
         except KeyError:                               # a malformed executor entry
             continue
-    return closed
+    return {"closed": closed, "refused": [], "other_clients": others}
 
 
 def status():
@@ -235,4 +287,8 @@ if __name__ == "__main__":
     for row in st:
         print(f"  {row['name']}: {'OPEN (a connection is held)' if row['open'] else 'closed'}")
     if len(sys.argv) > 1 and sys.argv[1] == "disconnect":
-        print("closed:", ", ".join(close_all()) or "(nothing was open)")
+        r = close_all(force="--force" in sys.argv)
+        if r.get("refused"):
+            print("REFUSED:", r["reason"])
+        else:
+            print("closed:", ", ".join(r["closed"]) or "(nothing was open)")

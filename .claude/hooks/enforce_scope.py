@@ -56,10 +56,95 @@ DEFAULT_SAFE = {
     # local, non-network utilities needed to set up / inspect an engagement and run
     # /generate-scope (hashing the scope file, local text munging, reading the framework repo).
     "sha256sum", "shasum", "md5sum", "sed", "awk", "git",
+    # Shell builtins that ARE commands: local, non-network, and unavoidable in ordinary scripting.
+    # They live here rather than in a skip list so they are recognised and allowed — skipping them
+    # would leave a command with no identifiable binary, which fails closed. `[` and `[[` are the
+    # test builtin; without them every `if [ -f x ]` was denied.
+    "[", "[[", ":", "read", "local", "declare", "shift", "return", "break", "continue",
+    "unset", "export", "set", "eval_", "printf", "sleep", "seq", "xargs", "env",
 }
 
 INTRODUCERS = {"sudo", "env", "xargs", "nohup", "nice", "time", "watch", "command", "then",
-               "do", "exec", "-exec", "-execdir", "-ok", "timeout", "stdbuf", "setsid"}
+               "do", "exec", "-exec", "-execdir", "-ok", "timeout", "stdbuf", "setsid",
+               # Shell KEYWORDS. Without these, `if [ -f x ]; then …` had `if` read as a program
+               # name and denied as "not in the approved allow-list" — an ordinary conditional
+               # blocked as though it were offensive tooling. They introduce a command; they are
+               # never themselves one.
+               "if", "elif", "else", "fi", "while", "until", "done",
+               "esac", "function", "{", "}", "!", "coproc"}
+
+#: `for x in a b c` / `select` / `case x in` are followed by a VARIABLE and a WORD LIST, not by a
+#: command. Treating them as plain introducers made `for t in testing/*.py; do …` read the glob as
+#: a program name. So they suppress binary-detection until the keyword that genuinely introduces
+#: one — `do` or `then` — arrives. `;` does not end the suppression, because in `for … ; do` the
+#: semicolon sits in the middle of the construct rather than between two commands.
+LIST_KEYWORDS = {"for", "select", "case"}
+RESUME_KEYWORDS = {"do", "then"}
+
+#: Shell builtins that are not programs and can never be offensive tooling. `[` is the one that
+#: actually bit: `if [ -f x ]; then …` denied with "'[' is NOT in the approved allow-list".
+#: They are skipped rather than allow-listed — a builtin is not a binary, so it does not belong in
+#: an engagement's binary allow-list in the first place.
+#: ONLY pure syntax — tokens that terminate a construct and are never a command in their own right.
+#: Deliberately narrow. An earlier version also listed `echo`, `test`, `read` and friends here, which
+#: was wrong in a way worth recording: those ARE commands, so skipping them left `echo $((1 + 2))`
+#: with no binary at all, and "could not identify the command's binary" is a fail-CLOSED deny. The
+#: skip list must contain only things that can never be the command; anything that can belongs in
+#: DEFAULT_SAFE, where it is recognised and allowed rather than made invisible.
+SHELL_BUILTINS = {"]", "]]"}
+
+#: Redirection operators. The token AFTER one is a FILENAME, never a command — `while read l;
+#: do …; done < f` was denying because `<` was read as a program and then `f` as another.
+REDIRECT_RE = re.compile(r"^(?:\d?)(?:<{1,3}|>{1,2}|&>|>&|<>)$")
+
+#: Tokens that follow an introducer but cannot possibly be a program name — a duration or a count.
+#: `timeout 60 curl …` previously read `60` as the binary and denied it, which blocked the
+#: framework's OWN documented pattern (`timeout 2h <cmd>`, global/CLAUDE.md §2F-NET). The wall and
+#: the manual disagreed, and the wall was wrong.
+NON_BINARY_ARG_RE = re.compile(r"^\d+(?:\.\d+)?[smhdSMHD]?$")
+
+#: A heredoc body is DATA being written, not a command line. Parsing it as one made every inline
+#: `python3 - <<'PY' … PY` a minefield: `collections.Counter` was read as a hostname and denied as
+#: an out-of-scope target.
+#:
+#: Stripping it costs no real protection. A destination inside a heredoc is only ever contacted
+#: once the resulting script RUNS — and at that point the command line is `python3 script.py`, in
+#: which the hook can already see nothing. The gap existed either way; this only stops the wall
+#: firing on text that was never a command. The HARD FLOOR still scans the untouched original.
+HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1\s*\n.*?^\s*\2\s*$",
+                        re.DOTALL | re.MULTILINE)
+
+
+#: `python -m <module>` / `python3 -m <module>`. The operand is an import path, which is shaped
+#: identically to a hostname (`orchestrator.cli`, `http.server`, `json.tool`). Matched only with
+#: python as the program so another tool's `-m` flag keeps being inspected normally.
+PY_MODULE_RE = re.compile(r"\bpython[0-9.]*\s+(?:-[A-Za-z]+\s+)*-m\s+[A-Za-z_][\w.]*")
+
+#: The VALUE of a Cookie header. Session blobs routinely embed version strings (`1.0.1.1` in
+#: Cloudflare's `__cf_bm`) that are shaped exactly like IPv4 addresses, so scanning them for
+#: destinations denies legitimate replay of a captured authenticated request. Only the value is
+#: removed — the URL the tool actually connects to is still inspected, which is what scope is
+#: about: a cookie cannot change where the connection goes.
+#: Alongside Cookie: `Origin` and `Referer`. All three are request METADATA describing the caller,
+#: never the destination — curl connects to the URL, and no header value can change that. Testing
+#: CORS requires sending an Origin the target does not own (that IS the test), and reading it as a
+#: target denied a standard, non-destructive preflight against an in-scope host.
+#:
+#: Scoped deliberately to these three rather than all headers: a header like `X-Forwarded-For` can
+#: still legitimately reveal a host worth noticing, and narrowing the parse further than necessary
+#: is how a wall stops seeing things.
+OPAQUE_HEADERS = ("Cookie", "Origin", "Referer")
+COOKIE_HEADER_RE = re.compile(
+    r"""(?:-H|--header)\s+(?P<q>['"])\s*(?:%s)\s*:.*?(?P=q)""" % "|".join(OPAQUE_HEADERS),
+    re.IGNORECASE | re.DOTALL)
+
+
+def strip_heredoc_bodies(cmd):
+    """Replace heredoc bodies with the delimiter alone, keeping the command line itself intact."""
+    try:
+        return HEREDOC_RE.sub(lambda m: "<<" + m.group(2) + "\n", cmd)
+    except (re.error, RecursionError):
+        return cmd
 
 OPERATOR_RE = re.compile(r"^(\||\|\||&&|&|;|\(|\))$")
 ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -111,6 +196,99 @@ def emit(decision, reason=""):
         out["hookSpecificOutput"]["permissionDecisionReason"] = reason
     sys.stdout.write(json.dumps(out))
     sys.exit(0)
+
+
+#: What makes a directory a workspace root: `engagements/` (where the scope locks the hook reads
+#: actually live) PLUS at least one of `global/` or `.claude/`.
+#:
+#: The pairing is deliberate. `engagements/` alone would be too loose — matching a directory that
+#: merely shares the name would send the hook looking for scope locks that do not exist, and a
+#: workspace with no readable lock denies EVERYTHING (Phase-1 lockdown), including `python3`. That
+#: is not a hypothetical: it happened while building this, and it locks the operator out of their
+#: own machine. `global/` alone would be far too loose in the other direction. Requiring
+#: `engagements/` and one corroborating sibling matches every real workspace and every test
+#: fixture, and matches a home directory not at all.
+WORKSPACE_ANCHOR = "engagements"
+WORKSPACE_CORROBORATORS = ("global", ".claude")
+
+#: Written by the operator to say "this machine has a workspace, and it is here." Read when the
+#: session was not started inside one. See resolve_workspace_root() for why this exists.
+WORKSPACE_REGISTRY = "~/.config/offsec/workspace_root"
+
+
+def _is_workspace(path):
+    try:
+        if not os.path.isdir(os.path.join(path, WORKSPACE_ANCHOR)):
+            return False
+        return any(os.path.exists(os.path.join(path, c)) for c in WORKSPACE_CORROBORATORS)
+    except (OSError, TypeError):
+        return False
+
+
+def _walk_up(start, limit=12):
+    """Yield start and each parent, bounded so a pathological path cannot spin."""
+    cur = os.path.abspath(start) if start else None
+    for _ in range(limit):
+        if not cur:
+            return
+        yield cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return
+        cur = parent
+
+
+def resolve_workspace_root(payload):
+    """Find the workspace this command belongs to, however the session was started.
+
+    WHY THIS EXISTS — a real failure, found 2026-07-28.
+    Claude Code loads hooks from the SESSION's project root and exports it as CLAUDE_PROJECT_DIR.
+    Before this function, the hook trusted that value directly. A session started at ~ therefore
+    looked for the workspace in ~, did not find it, and fell through to Phase-1 lockdown — which
+    LOOKS safe, and is, but only because it denies everything including `python3`.
+
+    Worse in the other direction: because the hooks were registered only inside the workspace, a
+    session started anywhere else never invoked this file at all. `curl` to an arbitrary host ran
+    from the operator's home line with nothing in the way. The wall was correct and simply not
+    plugged in — every test of its LOGIC passed while it protected nothing.
+
+    So the root must be resolved from where the WORK is, not from where the session began:
+
+        1. CLAUDE_PROJECT_DIR, if it really is a workspace
+        2. walking up from the command's own cwd  (the common case: session at ~, work in the bucket)
+        3. walking up from this process's cwd
+        4. the registry file — the operator declaring the workspace for the whole machine, which is
+           what makes a globally-registered hook protect a session started anywhere
+        5. failing all of that, the old value, so behaviour is unchanged where no workspace exists
+
+    Returns (root, how) — `how` is carried into denial messages so a block is explicable.
+    """
+    env_dir = os.environ.get("CLAUDE_PROJECT_DIR")
+    if env_dir and _is_workspace(env_dir):
+        return env_dir, "CLAUDE_PROJECT_DIR"
+
+    for cand in _walk_up((payload or {}).get("cwd")):
+        if _is_workspace(cand):
+            return cand, "command cwd"
+
+    try:
+        for cand in _walk_up(os.getcwd()):
+            if _is_workspace(cand):
+                return cand, "process cwd"
+    except OSError:
+        pass
+
+    reg = os.path.expanduser(WORKSPACE_REGISTRY)
+    try:
+        if os.path.isfile(reg):
+            with open(reg, encoding="utf-8") as fh:
+                declared = os.path.expanduser(fh.read().strip())
+            if declared and _is_workspace(declared):
+                return declared, "workspace registry"
+    except OSError:
+        pass
+
+    return (env_dir or (payload or {}).get("cwd") or os.getcwd()), "unresolved"
 
 
 def load_profile(project_dir):
@@ -308,31 +486,138 @@ def location_violation(command, is_remote):
     return None
 
 
+def split_command_substitutions(cmd):
+    """Return (bodies, scrubbed) for every `$( … )` and `` ` … ` `` span, handling NESTED parens.
+
+    Replaces a pair of regexes that both used `\\$\\(([^()]*)\\)` — a body that cannot contain a
+    parenthesis. Any substitution holding one (`$(grep -E '^(OK|FAILED)' f)`, an arithmetic
+    expression, a nested call) matched NEITHER, with two consequences:
+
+      * the inner command was never extracted, so the binary running inside it was never checked —
+        a real coverage hole, not a cosmetic one;
+      * the span was not scrubbed either, so its raw fragments were tokenised as program names and
+        denied. `python3 $L "…"` was refused as a binary called `$L`.
+
+    Balanced scanning fixes both at once: MORE commands actually get checked, and fewer ordinary
+    ones get blocked. `bodies` feeds the recursive binary check; `scrubbed` keeps the outer parse
+    from tripping over the fragments.
+    """
+    bodies, out, i, n = [], [], 0, len(cmd)
+    while i < n:
+        if cmd.startswith("$((", i):
+            # ARITHMETIC expansion, not a command substitution. Nothing inside it is ever executed,
+            # so it contributes no binaries — `$((1 + 2))` was yielding a program named "(1".
+            depth, j = 0, i + 1
+            while j < n:
+                if cmd[j] == "(":
+                    depth += 1
+                elif cmd[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            out.append(" ")
+            i = (j + 1) if j < n else n
+            continue
+        if cmd.startswith("$(", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if cmd.startswith("$(", j):
+                    depth += 1
+                    j += 2
+                    continue
+                if cmd[j] == "(":
+                    depth += 1
+                elif cmd[j] == ")":
+                    depth -= 1
+                    if not depth:
+                        break
+                j += 1
+            if depth == 0:                      # balanced: take the body, drop the span
+                bodies.append(cmd[i + 2:j])
+                out.append(" ; ")
+                i = j + 1
+                continue
+            # Unbalanced. Do NOT silently pass the remainder through as ordinary tokens —
+            # an unparseable command is exactly where fail-closed belongs.
+            bodies.append(cmd[i + 2:])
+            out.append(" ; ")
+            break
+        if cmd[i] == "`":
+            j = cmd.find("`", i + 1)
+            if j == -1:
+                bodies.append(cmd[i + 1:])
+                out.append(" ; ")
+                break
+            bodies.append(cmd[i + 1:j])
+            out.append(" ; ")
+            i = j + 1
+            continue
+        out.append(cmd[i])
+        i += 1
+    return bodies, "".join(out)
+
+
 def extract_subcommands(cmd):
-    inner = re.findall(r"\$\(([^()]*)\)", cmd)
-    inner += re.findall(r"`([^`]*)`", cmd)
-    return inner
+    """The inner command text of every substitution, so its binaries are checked too."""
+    return split_command_substitutions(cmd)[0]
 
 
 def candidate_binaries(cmd):
+    # A heredoc body is data, not a command line — see HEREDOC_RE. The hard floor still scans the
+    # untouched original in main(); this only narrows what is PARSED as a program name.
+    cmd = strip_heredoc_bodies(cmd)
     bins = set()
-    for sub in extract_subcommands(cmd):
-        bins |= candidate_binaries(sub)
+    sub_bodies, sub_scrubbed = split_command_substitutions(cmd)
+    for sub in sub_bodies:
+        if sub.strip() and sub != cmd:
+            bins |= candidate_binaries(sub)
     # unwrap `bash -c "..."` / `sh -c '...'` / `eval "..."` so a binary hidden inside the
     # quoted payload is still checked, not just the wrapper.
     for m in list(SHELL_C_RE.finditer(cmd)) + list(EVAL_RE.finditer(cmd)):
         inner = m.group(1) or m.group(2) or m.group(3) or ""
         if inner and inner != cmd:
             bins |= candidate_binaries(inner)
-    scrubbed = re.sub(r"\$\([^()]*\)", " ; ", cmd)
-    scrubbed = re.sub(r"`[^`]*`", " ; ", scrubbed)
+    scrubbed = sub_scrubbed          # balanced-scanned above; the bodies were checked separately
     try:
         tokens = shlex.split(scrubbed, comments=False, posix=True)
     except ValueError:
         tokens = re.split(r"\s+", scrubbed)
     expect = True
+    suppress = False          # inside a `for … in …` word list, where nothing is a command
+    skip_next = False         # the operand of a redirection: a filename, never a command
     for tok in tokens:
         if not tok:
+            continue
+        # shlex does not treat `;` as a separator, so `ls;` arrives as a single token and was
+        # denied as a program named "ls;". Strip it, process the real token, and let the semicolon
+        # do its job of introducing the next command.
+        ends_command = tok.endswith(";")
+        if ends_command:
+            tok = tok.rstrip(";")
+            if not tok:
+                expect = True
+                continue
+        if skip_next:
+            skip_next = False
+            if ends_command:
+                expect = True
+            continue
+        if REDIRECT_RE.match(tok):
+            skip_next = True
+            continue
+        if tok in SHELL_BUILTINS:
+            expect = False
+            continue
+        if tok in RESUME_KEYWORDS:
+            suppress = False
+            expect = True
+            continue
+        if tok in LIST_KEYWORDS:
+            suppress = True
+            expect = False
+            continue
+        if suppress:
             continue
         if OPERATOR_RE.match(tok):
             expect = True
@@ -346,13 +631,33 @@ def candidate_binaries(cmd):
             continue
         if tok.startswith("-"):
             continue
+        if NON_BINARY_ARG_RE.match(tok):
+            # A duration or count belonging to the introducer (`timeout 60 …`), not a program.
+            # Stay in `expect` so the REAL binary after it is still checked — skipping the token
+            # must not skip the command.
+            continue
         bins.add(os.path.basename(tok))
-        expect = False
+        expect = ends_command      # a trailing `;` means the NEXT token starts a new command
     return bins
 
 
 def extract_destinations(cmd):
-    """URL hosts + bare IPv4s + FQDN tokens (excluding filenames)."""
+    """URL hosts + bare IPv4s + FQDN tokens (excluding filenames).
+
+    Heredoc bodies are excluded — see HEREDOC_RE for why that costs no real coverage.
+    """
+    cmd = strip_heredoc_bodies(cmd)
+    # `python3 -m orchestrator.cli` — a MODULE PATH, not a hostname. It is shaped exactly like an
+    # FQDN and was denied as an out-of-scope target, which blocked the framework's own CLI.
+    # Scrubbed narrowly: only the operand of `-m`, and only when python is the program, so a real
+    # host passed to some other tool's `-m` flag is still seen.
+    cmd = PY_MODULE_RE.sub(" ", cmd)
+    # A COOKIE VALUE is an opaque session blob, never a destination. Cloudflare's `__cf_bm` and
+    # `cf_clearance` embed version strings like `1.0.1.1` and `1.2.1.1`, which match the IPv4
+    # pattern exactly — so replaying a captured authenticated request was denied for "targeting"
+    # 1.0.1.1. Only the cookie VALUE is removed; the rest of the command, including the URL curl
+    # actually connects to, is still fully inspected.
+    cmd = COOKIE_HEADER_RE.sub(" -H Cookie:<redacted> ", cmd)
     dests = set()
     for host in URL_RE.findall(cmd):
         host = host.split("@")[-1]          # strip userinfo
@@ -386,6 +691,11 @@ def file_fed_targets(command, project_dir, limit=262144):
     Returns (dests, unresolved). `unresolved` is True when the command sources targets from a
     file/stdin the hook could not read — the caller must then fail closed, because the asset
     boundary cannot be verified for invisible targets (e.g. `nmap -iL out.txt`, `httpx < list`)."""
+    # Heredoc bodies first: `python3 - <<'PY' … PY` was matching the stdin-redirect regex below,
+    # capturing the delimiter `'PY'` as a target-list FILE, failing to resolve it, and denying with
+    # "sources targets from a file the hook could not read". A heredoc supplies literal text, not a
+    # list of destinations.
+    command = strip_heredoc_bodies(command)
     dests, files, unresolved = set(), [], False
     try:
         toks = shlex.split(command, comments=False, posix=True)
@@ -396,8 +706,10 @@ def file_fed_targets(command, project_dir, limit=262144):
             files.append(toks[i + 1])
         elif "=" in t and t.split("=", 1)[0] in TARGET_LIST_FLAGS:
             files.append(t.split("=", 1)[1])
-    # stdin redirect: `tool < file`
-    files += re.findall(r"<\s*([^\s;&|<>]+)", command)
+    # stdin redirect: `tool < file`. The lookarounds exclude `<<` — that is a HEREDOC introducing
+    # literal text, not a file of targets. Without them, `python3 - <<'PY'` captured the delimiter
+    # `'PY'` as a target-list file, failed to resolve it, and denied every inline script.
+    files += re.findall(r"(?<!<)<(?!<)\s*([^\s;&|<>]+)", command)
     # `cat file | tool` — the file's contents become the tool's stdin
     for m in re.finditer(r"\b(?:cat|type)\s+([^|;&<>]+?)\s*\|", command):
         try:
@@ -617,7 +929,11 @@ def main():
         except re.error:
             continue
 
-    project_dir = os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd") or os.getcwd()
+    # Resolved from where the WORK is, not where the session started — see resolve_workspace_root().
+    # Registering this hook globally is only safe because of that: without it, a session started
+    # outside the workspace either denies everything (Phase-1 lockdown, including python3) or, if
+    # never registered at all, denies nothing.
+    project_dir, _root_how = resolve_workspace_root(payload)
 
     # ---- PROGRAM RATE CEILING ------------------------------------------------------------
     # Deliberately placed BEFORE the soft-boundary valve, alongside the hard floor.
