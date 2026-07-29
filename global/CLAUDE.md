@@ -362,7 +362,24 @@ always cheaper than drafting a report that cannot be filed.
 >    run that step locally — do NOT silently run it locally. Nothing routes automatically; you
 >    dispatch, and you confirm you dispatched.
 >
-> You may not begin reconnaissance or testing of any asset until steps 1–5 are complete
+> 6. **Run the opsec check — before the first request.**
+>    ```
+>    python3 QUICK-ACCESS/opsec_check.py
+>    ```
+>    (Also `/opsec-check`, or when the operator says "run the opsec check".) One command verifies
+>    the protections are actually ON: the scope wall registered **and firing** — tested by handing
+>    it a request it must deny, not by reading settings.json — the engagement's scope lock approved
+>    with a rate ceiling, execution resolving to the executor, nothing scanning from this machine,
+>    no Anthropic API key present here, nothing stranded on the box, RAM headroom, and the operating
+>    context loaded. It makes **no network requests** by default, so it is cheap and carries no
+>    traffic risk (`--net` adds the connection guard, `--gate` the full pre-engagement gate).
+>
+>    **`CLEAR` or you do not start.** A `FAIL` means a protection is off — fix it, never work around
+>    it. An `UNKNOWN` is **not** a pass: "could not determine" is the state that hides real failures,
+>    so it deliberately keeps the run from coming back clean. Re-run it after anything that changes
+>    the machine's posture, and do not substitute your own reading of the files for its verdict.
+>
+> You may not begin reconnaissance or testing of any asset until steps 1–6 are complete
 > and the operator has confirmed the target and scope.
 
 ---
@@ -617,6 +634,28 @@ folder). When you create or reuse such an account, record it in `_ACCOUNTS/share
 **IDENTIFIERS ONLY** (email / persona / which engagements used it). **NEVER store plaintext passwords** —
 those stay operator-memorized or in the encrypted vault. Bucket-only, never git/public. No real PII / KYC /
 live session tokens here.
+
+### Portable context — keep it current, in the same work that changed it
+The durable operating context that travels between machines lives at
+`~/Workspace/workspace-manager/claude/portable/` (`OPERATING-CONTEXT.md` = the rules and posture,
+`STATE.md` = what is in flight). It is imported at the machine level, so **every** session on this
+machine — and on any other machine set up from it — starts from those files. That is exactly why a
+stale one is worse than none: the next session trusts it.
+
+**When something DURABLE changes, update it in the same piece of work that changed it** — not later,
+not "when we push." Durable means a rule, a mechanism, a location, a posture, a standing decision, a
+tool that replaces another, or a constraint the operator has stated. Live state (in flight, blocked,
+next) goes in `STATE.md`.
+
+**Do NOT mirror ordinary work there.** Findings, per-engagement progress, run logs and test results
+belong in that engagement's `_STATUS.md`, `NOTES.md`, `findings/` and `_NEEDS-REVIEW/`. The portable
+files are context, not a journal — if you would touch them more than a couple of times a session, you
+are writing the wrong things into them.
+
+**Two cautions.** (1) These files are shared across machines; until the second-workstation lock
+exists, a second machine's edits need a deliberate merge, never a blind overwrite. (2) They are
+version-controlled in a repo — **never write a target hostname, a program name, or credential
+material into them.**
 
 ### Program data & engagement layout — platform / bounty-vs-no-bounty convention
 Program scope data is filed by **platform → bounty status → program**, and live engagements mirror it:
