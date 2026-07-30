@@ -184,13 +184,16 @@ blocks. No asterisks, hashes, backticks, arrows, or bullet characters. No URLs. 
 Nothing that only makes sense to the eye — if it would be read aloud as punctuation salad, leave
 it out entirely.
 
-Write in plain spoken prose, in full sentences and ordinary paragraphs, the way a person actually
-talks. Explain each technical term in passing the first time it appears. If you must refer to
-something normally written as code or an address, describe it in words.
+Write in plain spoken prose, in full sentences and ordinary paragraphs, the way a knowledgeable
+instructor actually talks. Explain each technical term in passing the first time it appears. If you
+must refer to something normally written as code or an address, describe it in words. Spell numbers,
+addresses, and symbols out as words, and expand an acronym the first time before using it as words.
 
-Turn the material below into a natural two-speaker conversation, roughly eight to ten minutes
-spoken. One speaker is curious and asks what a smart newcomer would genuinely ask; the other
-explains clearly, without jargon, and never talks down or pads.
+Deliver it as ONE single narrator speaking straight through, roughly eight to ten minutes spoken.
+No dialogue, no second speaker, no interviewer, no question-and-answer, no character names — just one
+calm, clear voice explaining the topic from start to finish. Do NOT frame it as part of a numbered
+series and do NOT announce a lesson number: no "lesson one", no "the fifth lesson", no "in this
+series". It is a single self-contained explainer that stands on its own.
 
 No sound effects, no music, no stage directions.
 

@@ -56,6 +56,15 @@ DEFAULT_SAFE = {
     # local, non-network utilities needed to set up / inspect an engagement and run
     # /generate-scope (hashing the scope file, local text munging, reading the framework repo).
     "sha256sum", "shasum", "md5sum", "sed", "awk", "git",
+    # VERIFICATION tools. Read-only, local, and target-independent: they inspect a file that is
+    # already on disk and cannot reach a target. They are here rather than in a scope-lock because
+    # the allow-list is compiled from approved TTPs, and "scan the thing I just downloaded" is not a
+    # TTP — so without this it could never appear on any engagement, and the one safety step the
+    # operator specifically asked for was the one step that could not run.
+    # Deliberately NOT included: `freshclam` (fetches signature updates) and `gpg` (--recv-keys hits
+    # a keyserver). Both can reach the network, so they stay an operator action. `gpgv` verifies
+    # against a local keyring only.
+    "clamscan", "gpgv", "sha512sum", "b2sum", "cksum",
     # Shell builtins that ARE commands: local, non-network, and unavoidable in ordinary scripting.
     # They live here rather than in a skip list so they are recognised and allowed — skipping them
     # would leave a command with no identifiable binary, which fails closed. `[` and `[[` are the
@@ -166,7 +175,13 @@ FQDN_RE = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b"
 FILE_EXT = {"txt", "js", "json", "yaml", "yml", "md", "html", "htm", "php", "xml", "csv",
             "log", "sh", "conf", "cfg", "ini", "env", "png", "jpg", "jpeg", "gif", "svg",
             "pdf", "zip", "gz", "tar", "py", "go", "rb", "bak", "old", "map", "ts", "css",
-            "pem", "key", "crt", "sql", "db", "bin", "exe", "dll"}
+            "pem", "key", "crt", "sql", "db", "bin", "exe", "dll",
+            # Archive/package/signature extensions. Without these, `node-v24.18.1-linux-x64.tar.xz`
+            # is read as a hostname and an approved download is denied - which happened repeatedly
+            # on 2026-07-29 and blocked a toolchain install twice.
+            # `so` is deliberately absent: it is Somalia's ccTLD, and a real host could end in it.
+            "xz", "tgz", "zst", "lz", "tbz", "whl", "wasm", "sig", "asc", "lock",
+            "deb", "rpm", "apk", "jar", "war", "iso", "dmg", "msi", "node"}
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 
 # Non-negotiable HARD FLOOR — enforced in EVERY mode (even soft-boundary / autonomous), for EVERY
@@ -425,6 +440,72 @@ _NETWORK_BINARIES = frozenset({
 # the executor. The asset wall still inspects the destination, so this is not a bypass.
 _TRANSPORT_BINARIES = frozenset({"ssh", "scp", "rsync", "sftp"})
 
+# Hosts that distribute TOOLCHAINS and PACKAGES. Fetching from one of these is PROVISIONING, not
+# testing: it tells an observer "this machine installs Node", never "this machine is interested in
+# <target>". Sending it to the executor would also be pointless - it would put the binary on a box
+# that is not the one that needs it.
+#
+# This closes a real conflation. Without it, "no testing traffic from my machine" gets read as "this
+# machine may not reach the internet at all", so the agent concludes it cannot obtain a tool it needs
+# and stops. That is not what the rule says.
+#
+# HARD-CODED and target-independent BY DESIGN: never read from an engagement, never widened at
+# runtime, exact authority match only - `nodejs.org.evil.com` does not qualify.
+#
+# DELIBERATELY NOT HERE:
+#   github.com / raw.githubusercontent.com / gitlab.com - cloning a repo reveals WHICH target you
+#     are interested in. That is target-linked traffic even though the host is generic.
+#   NVD / GHSA / MITRE / vendor advisory hosts - target-linked for the same reason. Those go through
+#     the SS2F-WEB advisory allow-list, which is a separate decision.
+#
+# Scope is untouched: this affects only WHERE a fetch may run, never WHETHER the host is in scope.
+# A provisioning host still has to be in the engagement's assets to be reachable at all.
+_PROVISIONING_HOSTS = frozenset({
+    "nodejs.org",
+    "registry.npmjs.org",
+    "pypi.org", "files.pythonhosted.org",
+    "proxy.golang.org", "sum.golang.org",
+    "crates.io", "static.crates.io",
+    "rubygems.org",
+    "deb.debian.org", "security.debian.org", "archive.ubuntu.com", "ports.ubuntu.com",
+})
+
+
+def _url_authorities(seg):
+    """Every non-loopback URL authority in a segment: lowercased, userinfo/port/trailing dot stripped.
+
+    Returns [] when the segment carries no scheme'd URL at all - a local file read or a bare loopback
+    call - which is why `curl -o out.json somefile` is not treated as network work.
+    """
+    hosts = []
+    for auth in re.findall(r"https?://([^/\s\"'`>|\\]+)", seg, re.I):
+        host = auth.rsplit("@", 1)[-1]                      # drop user:pass@
+        if host.startswith("["):                            # bracketed IPv6 literal
+            host = host[1:host.index("]")] if "]" in host else host[1:]
+        else:
+            host = host.split(":", 1)[0]                    # drop :port
+        host = host.rstrip(".").lower()
+        if host in ("localhost", "::1", "0.0.0.0") or host.startswith("127."):
+            continue
+        hosts.append(host)
+    return hosts
+
+
+def _is_engagement_target(host, profile):
+    """True when this host is in the engagement's scope as a TARGET, not merely approved egress.
+
+    Guards the one case where the provisioning exemption would be wrong: a program whose asset IS a
+    package registry (GitHub and npm both run bounty programs). `assets.hosts` cannot answer this -
+    it is overloaded, holding both real targets and operator-approved egress hosts like nodejs.org -
+    but a program that owns a registry would carry it as a wildcard/apex, which is unambiguous.
+    """
+    assets = (profile or {}).get("assets") or {}
+    for entry in (assets.get("wildcards") or []):
+        apex = str(entry).lstrip("*").lstrip(".").rstrip(".").lower()
+        if apex and (host == apex or host.endswith("." + apex)):
+            return True
+    return False
+
 
 def execution_is_remote(project_dir):
     """True / False / None(unknown) — does execution resolve to a remote executor?
@@ -447,11 +528,12 @@ def execution_is_remote(project_dir):
         sys.path[:] = saved
 
 
-def location_violation(command, is_remote):
+def location_violation(command, is_remote, profile=None):
     """Return the offending binary when a network tool would run HERE but should run on the executor.
 
     Returns None when: execution is local or unknown, the dispatcher is calling, the command is a
-    transport invocation, or no network-facing binary is present.
+    transport invocation, no network-facing binary is present, or a curl/wget fetch is aimed only at
+    toolchain-distribution hosts (see _PROVISIONING_HOSTS).
     """
     if is_remote is not True:
         return None
@@ -480,7 +562,15 @@ def location_violation(command, is_remote):
             # curl/wget are general-purpose; only flag them when aimed at a real remote destination,
             # so reading a local file or hitting localhost is not swept up.
             if binary in ("curl", "wget"):
-                if not re.search(r"https?://(?!localhost|127\.|\[::1\])", seg):
+                hosts = _url_authorities(seg)
+                if not hosts:
+                    continue                       # local file, loopback, or no URL at all
+                # Provisioning is not testing traffic. Exempt only when EVERY destination in the
+                # command is a toolchain host AND none of them is this engagement's actual target.
+                if all(
+                    h in _PROVISIONING_HOSTS and not _is_engagement_target(h, profile)
+                    for h in hosts
+                ):
                     continue
             return binary
     return None
@@ -666,7 +756,17 @@ def extract_destinations(cmd):
             dests.add(host.lower())
     for ip in IPV4_RE.findall(cmd):
         dests.add(ip)
-    for tok in FQDN_RE.findall(cmd):
+    # A URL's PATH/QUERY is NOT a destination — the command connects to the AUTHORITY, which the
+    # URL_RE pass above already captured. Re-scanning the whole URL with FQDN_RE misread the dotted
+    # FILENAME as a second target host: the approved download
+    #     https://nodejs.org/dist/v24.18.1/node-v24.18.1-linux-x64.tar.xz
+    # was DENIED for "targeting node-v24.18.1-linux-x64.tar.xz" (the trailing `.xz` slips past
+    # FILE_EXT). Strip whole scheme'd URLs before the FQDN pass so only BARE (schemeless) fqdn tokens
+    # are host-checked. This does NOT weaken the wall: any scheme-prefixed host — even inside a query
+    # string — is still caught by the URL_RE pass above, and bare out-of-scope FQDNs are still caught
+    # by the loop below. It only stops a filename in a URL path from being read as a target host.
+    cmd_fqdn = re.sub(r"https?://[^\s\"'`>|\\]+", " ", cmd, flags=re.I)
+    for tok in FQDN_RE.findall(cmd_fqdn):
         t = tok.lower()
         if t in dests:
             continue
@@ -964,7 +1064,7 @@ def main():
     # deliberate way to say otherwise is settings.EXECUTE_MODE = "local", which is specific and
     # typed rather than a blanket switch.
     _is_remote = execution_is_remote(project_dir)
-    _loc = location_violation(command, _is_remote)
+    _loc = location_violation(command, _is_remote, _ceiling_profile)
     if _loc:
         emit("deny", f"'{_loc}' is a network-facing tool and execution for this workspace resolves "
                      f"to REMOTE — so it must run ON the executor, not from this machine. Invoked "

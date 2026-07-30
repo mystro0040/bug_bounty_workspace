@@ -126,6 +126,13 @@ for name, cmd in [
     ("python3 -m module.path", "python3 -m orchestrator.cli auth-status"),
     ("substitution containing parentheses", "R=$(python3 x.py | grep -E '^(OK|FAILED)')"),
     ("arithmetic expansion", "echo $((1 + 2))"),
+    # Archive/package filenames are dotted tokens that look exactly like hostnames. Before these
+    # were added to FILE_EXT, `node-v24.18.1-linux-x64.tar.xz` was read as a target and an approved
+    # download was refused - twice on 2026-07-29.
+    ("archive filename is not a hostname", "grep pattern node-v24.18.1-linux-x64.tar.xz"),
+    ("wheel filename", "ls dist/pkg-1.2.3-py3-none-any.whl"),
+    ("signature + checksum files", "ls release.tar.zst release.sig release.asc"),
+    ("package files", "ls build/app.deb build/app.rpm build/app.apk"),
 ]:
     d, why = decide(cmd)
     check(name, d == "allow", why[:70])

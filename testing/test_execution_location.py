@@ -67,7 +67,7 @@ def check(label, cond, detail=""):
         print(f"  FAIL {label}" + (f"\n         {detail}" if detail else ""))
 
 
-def build(tmp, mode="remote", shields=True, with_settings=True):
+def build(tmp, mode="remote", shields=True, with_settings=True, no_provisioning=False):
     """A minimal workspace the hook can read."""
     g = os.path.join(tmp, "global")
     os.makedirs(g, exist_ok=True)
@@ -87,7 +87,14 @@ def build(tmp, mode="remote", shields=True, with_settings=True):
             "allowed_binaries": ["httpx", "dnsx", "nuclei", "curl", "wget", "grep", "python3",
                                  "subfinder", "gau", "ssh", "rsync", "cat", "sort", "katana"],
             "always_allowed_extra": [], "denied_patterns": [], "rate_ceiling": 5,
-            "assets": {"hosts": ["target.example"], "wildcards": [], "cidrs": [], "ips": [],
+            # nodejs.org / registry.npmjs.org / pypi.org / deb.debian.org are here because the
+            # provisioning exemption is about WHERE a fetch may run, not WHETHER the host is in
+            # scope - the asset boundary still has to grant it, exactly as the operator granted
+            # these on the real engagement. `assets_no_provisioning` below builds the same fixture
+            # without them, to prove scope still governs.
+            "assets": {"hosts": ["target.example"] + ([] if no_provisioning else [
+                           "nodejs.org", "registry.npmjs.org", "pypi.org", "deb.debian.org"]),
+                       "wildcards": [], "cidrs": [], "ips": [],
                        "endpoints": [], "out_of_scope": []},
         }, fh)
     return tmp
@@ -159,6 +166,63 @@ def main():
                     "curl -sS http://localhost:9000/health"):
             d, why = ask(tmp, cmd)
             check(f"allowed: {cmd[:44]}", d == "allow", f"{d}: {why[:110]}")
+
+        print("\n[6B] TOOLCHAIN PROVISIONING is not testing traffic (added 2026-07-29)")
+        # A curl at a package/toolchain host reveals "this machine installs Node", never which
+        # target it is interested in - so sending it to the executor is pointless and blocking it
+        # made the agent conclude it was offline and stop. Scope is untouched: the host still has
+        # to be in the engagement's assets to be reachable at all.
+        for cmd in ("curl -fsSL https://nodejs.org/dist/v24.18.1/SHASUMS256.txt -o s.txt",
+                    "curl -fSLO https://nodejs.org/dist/v24.18.1/node-v24.18.1-linux-x64.tar.xz",
+                    "curl -sS https://registry.npmjs.org/next",
+                    "curl -sS https://pypi.org/simple/requests/",
+                    "wget https://deb.debian.org/debian/dists/stable/Release"):
+            d, why = ask(tmp, cmd)
+            check(f"provisioning allowed: {cmd.split()[1][:34]}", d == "allow", f"{d}: {why[:110]}")
+
+        print("\n[6C] ...and the exemption is NARROW - these must all still be DENIED")
+        # Exact authority match only. A lookalike host, a target host, and a mixed command that
+        # smuggles a second destination alongside a provisioning one all have to fail.
+        for label, cmd in (
+            ("lookalike host", "curl -sS https://nodejs.org.evil.com/x"),
+            ("subdomain of a provisioning host",
+             "curl -sS https://evil.nodejs.org/x"),
+            ("the engagement's own target", "curl -sSI https://target.example/"),
+            ("mixed: provisioning + another host",
+             "curl -sS https://nodejs.org/dist/index.json https://target.example/"),
+            ("provisioning host but a SCANNER, not curl",
+             "httpx -u https://nodejs.org -rl 5"),
+            ("chained after a provisioning fetch",
+             "curl -sS https://pypi.org/simple/ && httpx -u https://target.example -rl 5"),
+        ):
+            d, why = ask(tmp, cmd)
+            check(f"denied: {label}", d == "deny", f"{d}: {why[:110]}")
+
+        print("\n[6C-2] the exemption does NOT widen scope - an unapproved provisioning host still denies")
+        # This is the property that keeps the exemption honest. On an engagement where the operator
+        # has not approved nodejs.org, the asset boundary refuses it and the refusal names SCOPE,
+        # not execution location. Approving it stays a deliberate, auditable operator decision.
+        t_noprov = build(tempfile.mkdtemp(prefix="loctest-noprov-"), mode="remote",
+                         no_provisioning=True)
+        d, why = ask(t_noprov, "curl -fsSL https://nodejs.org/dist/index.json -o i.json")
+        check("unapproved provisioning host is denied", d == "deny", f"{d}: {why[:110]}")
+        check("denied by the ASSET boundary, not the location guard",
+              "asset scope" in why and "network-facing" not in why, why[:140])
+        shutil.rmtree(t_noprov, ignore_errors=True)
+
+        print("\n[6D] VERIFICATION binaries are always allowed, without being in any scope-lock")
+        # The allow-list is compiled from approved TTPs, and "scan the file I just downloaded" is
+        # not a TTP - so without this, the scanner could never run on any engagement. Note the
+        # fixture's allowed_binaries does NOT contain any of these.
+        for cmd in ("clamscan /tmp/node-v24.18.1-linux-x64.tar.xz",
+                    "sha512sum /tmp/artifact.bin",
+                    "cksum /tmp/artifact.bin",
+                    "gpgv /tmp/release.sig /tmp/release"):
+            d, why = ask(tmp, cmd)
+            check(f"allowed: {cmd.split()[0]}", d == "allow", f"{d}: {why[:110]}")
+        for cmd in ("freshclam", "gpg --recv-keys ABCD1234"):
+            d, _ = ask(tmp, cmd)
+            check(f"still denied (can reach the network): {cmd.split()[0]}", d == "deny")
 
         print("\n[7] transport is not a local scan")
         d, why = ask(tmp, "rsync -az -e ssh out.txt recon@203.0.113.10:/home/recon/run/")
