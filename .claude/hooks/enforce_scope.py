@@ -181,7 +181,12 @@ FILE_EXT = {"txt", "js", "json", "yaml", "yml", "md", "html", "htm", "php", "xml
             # on 2026-07-29 and blocked a toolchain install twice.
             # `so` is deliberately absent: it is Somalia's ccTLD, and a real host could end in it.
             "xz", "tgz", "zst", "lz", "tbz", "whl", "wasm", "sig", "asc", "lock",
-            "deb", "rpm", "apk", "jar", "war", "iso", "dmg", "msi", "node"}
+            "deb", "rpm", "apk", "jar", "war", "iso", "dmg", "msi", "node",
+            # JS/TS module extensions. Same defect as the archive block above, found the same way:
+            # `node harness.mjs` was denied because `mjs` was read as a TLD. These are unavoidable
+            # when a PoC targets a JS/TS codebase, which is most of this workspace's source-audit
+            # work. None is a real TLD.
+            "mjs", "cjs", "mts", "cts", "tsx", "jsx", "vue", "svelte"}
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 
 # Non-negotiable HARD FLOOR — enforced in EVERY mode (even soft-boundary / autonomous), for EVERY
