@@ -460,6 +460,22 @@ python3 <FRAMEWORK_SOURCE repo>/utilities/ttp_manager/ttp_manager.py verify
 This is the TTP-library analogue of the production-integrity guard: it catches accidental corruption
 of the source of truth before it can flow into an engagement.
 
+### Scope is compiled from what the PROGRAM permits — never from what we can reach today
+
+Curation answers one question: does the program permit this technique on these assets? It does **not**
+answer "can we run it right now". Whether a test account exists, whether an out-of-band listener is
+installed, whether source is checked out — none of that is an input to scope generation.
+
+**So a technique we cannot run yet is still approved.** We simply do not run it until we can. The
+profile records what is blocked in `curation.gated_but_approved` (authenticated session, two test
+accounts, an OOB listener, local source, a target-supplied artifact) so the answer to "what would
+unlock the most" is visible on day one — as information, never as a filter.
+
+The reason is concrete. Filtering on what we currently hold means every credential or tool that
+arrives later forces a regenerate, and every regenerate is a fresh approval, a recompiled wall, and a
+chance to lose hand-added entries. **Scope changes when the PROGRAM changes, and at no other time.**
+An account arriving is not a scope change.
+
 ### Propagating TTP upgrades — update the master, then let engagements pull it (seamless but controlled)
 
 TTP improvements belong in the MASTER framework (`FRAMEWORK_SOURCE`), not just one engagement — so every
@@ -593,6 +609,42 @@ master framework playbooks (or a sandbox patch merged into the production tool) 
 
 You never edit the framework or a production tool during an engagement; discoveries flow *out*
 through the ledger, and back *in* only via an explicit, separate maintenance session.
+
+---
+
+## 2C-LOOP. Every engagement feeds the master library — this is a MECHANISM, not a habit
+
+§2C says discoveries flow out through the ledger and back in via a maintenance pass. That rule
+existed for weeks and **2 of 15 engagements actually had a ledger**, so there was nothing to promote
+from and eleven engagements' worth of technique had to be recovered afterwards by re-reading probe
+scripts. A rule with no code behind it is the characteristic failure here. So it now has code:
+
+1. **The ledger is created for you.** `scope_compiler.ensure_ledger()` writes
+   `BREAKTHROUGH_LEDGER.md` when an engagement's scope is compiled. Every engagement is scoped, so
+   every engagement has a ledger from day one. You do not create it and you never skip it.
+2. **Log the discovery WHEN IT HAPPENS.** A fix, a bypass, a technique that worked, a technique that
+   looked like it worked and did not — all of it, at the moment, not at close-out. The entries that
+   turned out to matter most were the ones about being wrong.
+3. **The loop is checked.** `ttp_manager.py promote --engagements <dir>` reads every ledger and
+   reports what has never reached the master library. `opsec_check.py` runs it, so an outstanding
+   promotion is visible at the start of every session. It is a WARN, never a FAIL — a debt, not an
+   unsafe condition, and it must not stop testing.
+4. **Settle every entry, one of two ways.** Promoted into the library: record the master task id in
+   backticks so the check can see it. Belongs somewhere else — a config rule, a hook, a tool fix:
+   write **NOT-A-LIBRARY-ITEM** and say where it went. An entry with neither shows as outstanding
+   until somebody settles it, and a promotion claim naming an id that does not exist in the library
+   is reported as a false claim rather than accepted.
+
+**What to promote, and the bias to hold.** The reflex is to add another attack technique. The higher
+value is usually the opposite: how you told a real result from the target behaving normally. Four
+wrong verdicts in one night produced `run-a-control-row-with-every-verdict`, which is worth more than
+any payload we could add. When an entry is about DISCRIMINATION — a control that killed a false
+positive, a differential that could not discriminate, a dead-end fingerprint, a tool that failed
+silently and looked like a clean negative — promote it first.
+
+**Where an entry lands.** Technique goes to the master TTP library. Agent behaviour and guardrails go
+to this config. Tool defects go to the tool. Engagement data (hosts, tokens, member ids, rate figures
+for one estate) NEVER graduates.
 
 ---
 

@@ -160,12 +160,63 @@ def load_tasks():
                             "requires": pol.get("requires", "none"),
                             "raw_commands": cmds, "binaries": sorted(bins),
                             "blob": (t.get("name", "") + " " + (t.get("purpose") or "") + " "
-                                     + " ".join(cmds)).lower()})
+                                     + " ".join(cmds)).lower(),
+                            # Separate from `blob` on purpose. `blob` feeds CAPABILITY_HINTS, which
+                            # EXCLUDES; this one feeds gating, which only ANNOTATES. Widening the
+                            # first to include `requirements` would silently change what gets
+                            # curated out, so the two stay apart.
+                            "gate_blob": (t.get("name", "") + " " + (t.get("purpose") or "") + " "
+                                          + (t.get("requirements") or "") + " "
+                                          + " ".join(cmds)).lower()})
     return out
 
 
+# Regexes, not substrings, and the reason is one word: "unauthenticated" CONTAINS "authenticated".
+# A substring match tagged a read-only header-disclosure technique as needing a login because its
+# own text said it needs no authentication. Anything matching the negative phrases is excluded first.
+GATING_HINTS = {
+    "authenticated_session": (r"(?<!un)authenticated\b", r"logged[- ]in", r"signed[- ]in",
+                              r"\byour session\b", r"session cookie", r"captured (jwt|token)",
+                              r"an account you own", r"valid session"),
+    "two_test_accounts": (r"two test accounts", r"\baccount a\b", r"\baccount b\b",
+                          r"second test account", r"cross[- ]account"),
+    "oob_listener": (r"\boast\b", r"collaborator", r"interactsh", r"out-of-band interaction host",
+                     r"callback host"),
+    "local_source": (r"local copy of in-scope source", r"a local source copy", r"source tree",
+                     r"\bcodeql\b", r"\bsemgrep\b", r"repository clone"),
+    "target_supplied_artifact": (r"\bapk\b", r"\basar\b", r"desktop client", r"mobile app"),
+}
+_GATE_NEGATIVES = re.compile(
+    r"no authentication|without authentication|unauthenticated|no account|"
+    r"pre-auth|before any token exists|no credentials needed")
+
+
+def gating(task):
+    """Which prerequisites this technique needs. Informational only — never a filter."""
+    blob = task["gate_blob"]
+    out = []
+    for gate, patterns in GATING_HINTS.items():
+        if gate in ("authenticated_session", "two_test_accounts") and _GATE_NEGATIVES.search(blob):
+            continue
+        if any(re.search(p, blob) for p in patterns):
+            out.append(gate)
+    return sorted(out)
+
+
 def relevant(task, caps, manual_only):
-    """Step 2b curation — is this technique appropriate to THIS program's assets and rules?"""
+    """Step 2b curation — is this technique appropriate to THIS program's assets and rules?
+
+    HARD RULE, do not change this without the operator saying so explicitly.
+    Curation answers ONE question: does the PROGRAM permit this technique on these assets?
+    It never answers "can we run it today". Whether an account exists, whether a listener is
+    installed, whether source is checked out — none of that is an input here. A technique we
+    cannot run yet is still approved; we simply do not run it until we can.
+
+    The reason is concrete. Filtering on what we currently possess means every credential, tool
+    or artifact that arrives later forces a scope regenerate, and every regenerate is a fresh
+    approval, a recompiled wall, and a chance to lose hand-added entries. Scope should change
+    when the PROGRAM changes, and at no other time. Gating is recorded by gating() instead.
+    """
     if manual_only and (set(task["binaries"]) & SCANNERS):
         return False, "scanner on a manual-only program"
     for cap, hints in CAPABILITY_HINTS.items():
@@ -532,8 +583,45 @@ def _enforce_automation_stance(engagement, manual_only):
     return stance
 
 
+LEDGER_TEMPLATE = """# BREAKTHROUGH LEDGER — {name}
+
+Append-only record of every successful fix, working bypass and reusable technique discovery made
+during this engagement. Entries are promotion candidates: generalized technique flows back into the
+master TTP library in a Tier-1 maintenance pass, engagement data never does.
+
+When an entry IS promoted, record the master task id in backticks so `ttp_manager.py promote` can
+see it. When it belongs somewhere other than the library — a config rule, a tool fix — say
+NOT-A-LIBRARY-ITEM and where it went. An entry with neither shows as outstanding until it is settled.
+
+Created automatically when this engagement's scope was compiled. It exists from day one so a
+discovery has somewhere to go the moment it happens, rather than being reconstructed afterwards from
+probe scripts — which is how eleven engagements' worth of technique was nearly lost.
+
+---
+
+_No entries yet. Add one the first time something here is fixed, bypassed or discovered. An empty
+ledger at close-out means the discoveries were lost, not that there were none._
+"""
+
+
+def ensure_ledger(d):
+    """Every engagement gets a breakthrough ledger, created here because every engagement is scoped.
+
+    This is the hook that makes the discovery-to-master loop a mechanism rather than a habit. The
+    rule existed in the config for weeks and two engagements in fifteen actually had a ledger, so
+    the promotion pass had nothing to read. Creating it is not optional and is never skipped.
+    """
+    path = os.path.join(d, "BREAKTHROUGH_LEDGER.md")
+    if os.path.isfile(path):
+        return False
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(LEDGER_TEMPLATE.format(name=os.path.basename(d)))
+    return True
+
+
 def compile_scope(engagement, cfg, update=False):
     d = eng_dir(engagement)
+    ensure_ledger(d)
     scope_file = find_scope_file(d)
     sha = hashlib.sha256(open(scope_file, "rb").read()).hexdigest()
     approved_path = os.path.join(d, "approved_TTPs.yaml")
@@ -553,7 +641,23 @@ def compile_scope(engagement, cfg, update=False):
     stance = _enforce_automation_stance(engagement, manual_only)
     _enforce_identification_header(engagement, cfg["header"][0])
 
-    approved, excluded = [], {}
+    approved, excluded, gated = [], {}, {}
+    for t in load_tasks():
+        ok, why = relevant(t, caps, manual_only)
+        if not ok:
+            excluded[why] = excluded.get(why, 0) + 1
+            continue
+        entry = {k: t[k] for k in ("id", "technique", "phase", "intent", "poc_only", "binaries")}
+        entry["commands"] = emit_commands(t, cfg)
+        entry["source"] = "framework"
+        # Annotation, not curation — see relevant().__doc__. These techniques ARE approved.
+        g = gating(t)
+        if g:
+            entry["gated_by"] = g
+            for k in g:
+                gated[k] = gated.get(k, 0) + 1
+        approved.append(entry)
+
     for t in load_tasks():
         ok, why = relevant(t, caps, manual_only)
         if not ok:
@@ -606,7 +710,12 @@ def compile_scope(engagement, cfg, update=False):
             "identification_header": {"name": hname, "value": hvalue},
         },
         "curation": {"included": len(approved),
-                     "excluded": [{"reason": k, "count": v} for k, v in sorted(excluded.items())]},
+                     "excluded": [{"reason": k, "count": v} for k, v in sorted(excluded.items())],
+                     # APPROVED techniques that cannot be RUN until something arrives. They are in
+                     # the profile and stay there; this is the day-one answer to "what is locked and
+                     # what would unlock the most". Getting the prerequisite NEVER needs a regenerate.
+                     "gated_but_approved": [{"needs": k, "count": v}
+                                            for k, v in sorted(gated.items(), key=lambda kv: -kv[1])]},
         "approved_ttps": approved,
         "approval": {"status": "PENDING_OPERATOR_REVIEW", "approved_by": None, "approved_at": None},
     }

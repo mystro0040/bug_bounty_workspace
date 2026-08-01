@@ -430,8 +430,69 @@ def test_program_rate_ceiling_beats_the_library():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_access_state_is_never_a_curation_input():
+    """Scope comes from what the PROGRAM permits, never from what we can reach today.
+
+    The failure this guards against is subtle and expensive: filtering out the techniques we
+    cannot run yet looks tidy, and it means every credential that arrives later forces a
+    regenerate — a fresh approval, a recompiled wall, and a chance to lose hand-added entries.
+    """
+    print("[curation] techniques we cannot run YET are still approved")
+    name, d = temp_engagement()
+    try:
+        SC.compile_scope(name, dict(BASE_CFG), update=True)
+        import yaml
+        prof = yaml.safe_load(open(os.path.join(d, "approved_TTPs.yaml"), encoding="utf-8"))
+        reasons = " ".join(e["reason"] for e in prof["curation"]["excluded"]).lower()
+        for word in ("auth", "account", "credential", "session", "listener"):
+            chk("nothing excluded for lacking '%s'" % word, word not in reasons, reasons)
+
+        ids = {t["id"] for t in prof["approved_ttps"]}
+        for gated_id in ("idor-single-cross-read", "reconcile-identifier-spaces-first",
+                         "jwt-alg-none-and-tamper"):
+            chk("%s is approved despite needing a login" % gated_id, gated_id in ids)
+
+        gates = {g["needs"]: g["count"] for g in prof["curation"]["gated_but_approved"]}
+        chk("the gate is RECORDED so the blocker is visible on day one",
+            gates.get("authenticated_session", 0) > 0 or gates.get("two_test_accounts", 0) > 0,
+            gates)
+
+        annotated = [t for t in prof["approved_ttps"] if t.get("gated_by")]
+        chk("gated entries carry their prerequisite inline", annotated, len(annotated))
+        chk("a read-only disclosure technique is NOT tagged as needing a login",
+            all("authenticated_session" not in (t.get("gated_by") or [])
+                for t in prof["approved_ttps"]
+                if t["id"] == "decode-load-balancer-persistence-cookie"))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_every_engagement_gets_a_ledger():
+    """The discovery-to-master loop starts here, and it must not depend on anyone remembering."""
+    print("[loop] compiling scope creates the breakthrough ledger")
+    name, d = temp_engagement()
+    ledger = os.path.join(d, "BREAKTHROUGH_LEDGER.md")
+    try:
+        chk("no ledger before compiling", not os.path.exists(ledger))
+        SC.compile_scope(name, dict(BASE_CFG), update=True)
+        chk("the ledger exists after compiling", os.path.exists(ledger))
+        body = open(ledger, encoding="utf-8").read()
+        chk("it tells the reader how to settle an entry",
+            "NOT-A-LIBRARY-ITEM" in body and "backticks" in body)
+
+        # An existing ledger is never clobbered — it is append-only and holds real work.
+        with open(ledger, "a", encoding="utf-8") as fh:
+            fh.write("\n## sentinel entry\n")
+        SC.compile_scope(name, dict(BASE_CFG), update=True)
+        chk("a second compile does NOT overwrite it",
+            "sentinel entry" in open(ledger, encoding="utf-8").read())
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     for t in (test_pending_by_default, test_constraints_are_carried_not_asserted,
+              test_access_state_is_never_a_curation_input, test_every_engagement_gets_a_ledger,
               test_program_rate_ceiling_beats_the_library,
               test_every_tool_in_a_chain_is_flagged, test_self_check_does_not_cry_wolf,
               test_manual_only_excludes_scanners, test_permanent_constraints_always_present,

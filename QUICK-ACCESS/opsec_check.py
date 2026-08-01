@@ -318,6 +318,34 @@ def check_attribution_identity():
            % ", ".join(platforms), path)
 
 
+def check_ttp_promotion_loop():
+    """Are engagement discoveries actually reaching the master library?
+
+    This is the visible end of the discovery-to-master loop. It is a WARN, never a FAIL: an
+    unpromoted lesson is a debt, not an unsafe condition, and it must not stop testing. It exists
+    because the loop was policy-only for weeks and quietly did not happen.
+    """
+    mgr = os.path.join(HOME, "Workspace", "Production_Ready", "public", "Offensive_Security",
+                       "bug-bounty-execution-framework", "utilities", "ttp_manager",
+                       "ttp_manager.py")
+    engagements = os.path.join(BUCKET, "engagements")
+    if not (os.path.exists(mgr) and os.path.isdir(engagements)):
+        return record("TTP promotion loop", UNKNOWN,
+                      "ttp_manager.py or the engagements directory was not found", mgr)
+    p = run([sys.executable, mgr, "promote", "--engagements", engagements], timeout=120)
+    out = (p.stdout or "") + (p.stderr or "")
+    if p.returncode == 0:
+        return record("TTP promotion loop", OK,
+                      "every engagement has a ledger and every entry reached the master library",
+                      mgr)
+    if p.returncode == 2:
+        missing = len([ln for ln in out.splitlines() if ln.strip().startswith("programs/")])
+        return record("TTP promotion loop", WARN,
+                      "%d ledger item(s) outstanding — run `ttp_manager.py promote` and settle them"
+                      % missing, mgr)
+    record("TTP promotion loop", UNKNOWN, "the promotion check did not run cleanly", mgr)
+
+
 # ---------------------------------------------------------------------------------------------
 # Optional, opt-in
 # ---------------------------------------------------------------------------------------------
@@ -367,6 +395,7 @@ CHECKS = [
     check_ram,
     check_portable_context,
     check_attribution_identity,
+    check_ttp_promotion_loop,
 ]
 
 GLYPH = {OK: "  OK  ", WARN: " WARN ", FAIL: " FAIL ", UNKNOWN: " ???  "}
