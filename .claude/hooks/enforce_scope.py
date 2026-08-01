@@ -186,7 +186,12 @@ FILE_EXT = {"txt", "js", "json", "yaml", "yml", "md", "html", "htm", "php", "xml
             # `node harness.mjs` was denied because `mjs` was read as a TLD. These are unavoidable
             # when a PoC targets a JS/TS codebase, which is most of this workspace's source-audit
             # work. None is a real TLD.
-            "mjs", "cjs", "mts", "cts", "tsx", "jsx", "vue", "svelte"}
+            "mjs", "cjs", "mts", "cts", "tsx", "jsx", "vue", "svelte",
+            # The framework's OWN encrypted-artifact extension (ENC_SUFFIX in
+            # execution/remote_data.py). Every result pulled home from the executor is
+            # `<name>.cms`, so reading one was denied with "cms is outside the approved
+            # asset scope" - the filename was parsed as an FQDN. Not a real TLD.
+            "cms"}
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 
 # Non-negotiable HARD FLOOR — enforced in EVERY mode (even soft-boundary / autonomous), for EVERY
