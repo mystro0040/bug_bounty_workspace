@@ -71,6 +71,12 @@ DEFAULT_SAFE = {
     # test builtin; without them every `if [ -f x ]` was denied.
     "[", "[[", ":", "read", "local", "declare", "shift", "return", "break", "continue",
     "unset", "export", "set", "eval_", "printf", "sleep", "seq", "xargs", "env",
+    # `ulimit` is REQUIRED by global/CLAUDE.md §2F-LOCAL — every grep/sed/awk/python pass
+    # over recon output is supposed to run inside `( ulimit -v 2000000; … )` so a runaway
+    # match cannot exhaust RAM and freeze the box mid-engagement. Denying it meant following
+    # the safety rule got you blocked, so the rule was quietly unusable. It is a builtin, it
+    # only ever LOWERS a limit, and it cannot reach the network.
+    "ulimit",
 }
 
 INTRODUCERS = {"sudo", "env", "xargs", "nohup", "nice", "time", "watch", "command", "then",

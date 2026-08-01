@@ -239,9 +239,54 @@ PLACEHOLDER_RX = re.compile(r"(example\.com|target\.com|<[A-Za-z_]*(?:TARGET|tar
 _SEPARATORS = re.compile(r"\|\||&&|[|;]")
 
 
+def _split_outside_quotes(line, keep=False):
+    """Split on shell separators, ignoring any that sit INSIDE quotes.
+
+    A plain regex split is wrong for exactly the commands we care most about. A command-injection
+    proof carries its separator inside the payload — `--data-urlencode "host=127.0.0.1; id"` — and
+    splitting on that semicolon cuts the command in half, so the attribution header that follows
+    looks like it belongs to a different process. That produced a false "header attached to the
+    wrong process" on a real profile, and a check that flags correct behaviour gets ignored.
+
+    Returns the pieces; with keep=True the separators are returned between them, so a caller can
+    rejoin the line unchanged.
+    """
+    out, buf, quote, i = [], [], None, 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote and (i == 0 or line[i - 1] != "\\"):
+                quote = None
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        two = line[i:i + 2]
+        if two in ("||", "&&"):
+            out.append("".join(buf))
+            if keep:
+                out.append(two)
+            buf, i = [], i + 2
+            continue
+        if ch in "|;":
+            out.append("".join(buf))
+            if keep:
+                out.append(ch)
+            buf, i = [], i + 1
+            continue
+        buf.append(ch)
+        i += 1
+    out.append("".join(buf))
+    return out
+
+
 def _command_segment(line, binary):
     """The sub-command that actually runs `binary`, and the part of it before any redirect."""
-    for seg in _SEPARATORS.split(line):
+    for seg in _split_outside_quotes(line):
         if re.search(rf"(^|[\s/`]){re.escape(binary)}\s", seg):
             head = re.split(r"\s(?:\d?>>?|>)\s", seg)[0]
             return seg, head
@@ -265,7 +310,10 @@ def _inject_all(line, task_binaries, cfg):
     """
     rate = cfg["rate_value"]
     hname, hvalue = cfg["header"]
-    parts = _SPLIT_KEEP.split(line)
+    # Quote-aware, for the same reason _command_segment is: a separator inside a payload string
+    # (`--data-urlencode "host=127.0.0.1; id"`) is part of the argument, not a new command. A plain
+    # regex split cut such a line in half and injected the header into the wrong piece.
+    parts = _split_outside_quotes(line, keep=True)
     for idx in range(0, len(parts), 2):                 # even indices are command segments
         seg = parts[idx]
         binary = next((b for b in task_binaries
@@ -876,9 +924,141 @@ def show(engagement):
             "self_check": self_check(engagement) or "PASS"}
 
 
+#: Tools that never put a request on the TARGET, so an attribution header on them is meaningless.
+#: Two distinct reasons, kept apart because they are different arguments:
+#:   * OFFLINE — reads and rewrites local files, sends nothing at all.
+#:   * ELSEWHERE — talks to a third party or to our own listener, never the program's estate.
+#: Requiring the header here is worse than pointless: it would send the program's name to an
+#: unrelated service, and a check that flags correct behaviour teaches you to ignore the check.
+OFFLINE_TOOLS = {"gf", "qsreplace", "semgrep", "whois"}
+ELSEWHERE_TOOLS = {"gau", "waybackurls", "interactsh-client"}
+_URL_HOST_RX = re.compile(r"https?://([A-Za-z0-9.-]+)")
+#: Flags that hand a tool something to aim at — a host, a URL, a domain, or a file of them.
+_TARGET_INPUT_RX = re.compile(r"(^|\s)-{1,2}(l|u|d|i|list|url|urls|target|targets|host|domain)"
+                              r"(\s|=)")
+
+
+#: Flags that hand a tool something to aim at — a host, a URL, a domain, or a file of them.
+_TARGET_INPUT_RX = re.compile(r"(^|\s)-{1,2}(l|u|d|i|list|url|urls|target|targets|host|domain)"
+                              r"(\s|=)")
+
+
+def _no_target_traffic(binary, command):
+    """True when this command cannot reach the program's own assets.
+
+    Conservative on purpose: a false positive here is a nuisance, a false NEGATIVE means traffic
+    going out unattributed. So a command is only exempted when it is definitively not target-bound.
+    """
+    if binary in OFFLINE_TOOLS or binary in ELSEWHERE_TOOLS:
+        return True
+    hosts = _URL_HOST_RX.findall(command)
+    if hosts:
+        # Every URL points at a recon source (crt.sh and friends) rather than the program.
+        return all(any(src in h for src in RECON_SOURCES) for h in hosts)
+    # No URL anywhere. Only exempt when the tool was ALSO given no target input: `httpx -l
+    # targets.txt` names no host here yet reaches every host in that file, while a tool's own
+    # maintenance call (`nuclei -update-templates`) takes no target and talks to its own project.
+    seg, _head = _command_segment(command, binary)
+    return not _TARGET_INPUT_RX.search(seg or command)
+
+
+def audit_headers():
+    """Re-verify EVERY compiled engagement's attribution header. A standing check, not a one-off.
+
+    `_enforce_identification_header` runs at compile time, which covers the moment a profile is
+    built and nothing after it. A program can update its policy, a profile can predate the check,
+    and a handle can be edited by hand — none of which recompiles anything. This walks every
+    compiled engagement and re-asks the question, so "is the header right" is answerable now rather
+    than as of whenever the profile happened to be built.
+
+    Four things are checked per engagement, because the header can be wrong in four ways:
+      1. NAME vs the program's own captured text — programs on one platform differ by a word.
+      2. PLATFORM PREFIX in the value vs the engagement's own platform path — a value carrying the
+         other platform's name is the copy-paste failure this is most likely to catch.
+      3. HANDLE in the value vs `operator-identity.md` for that platform.
+      4. Every emitted web command actually carrying the header, attached to the right process.
+
+    Returns a list of problem dicts. Empty means every compiled engagement is attributed correctly.
+    """
+    problems = []
+    identity = {}
+    if os.path.isfile(IDENTITY):
+        for line in open(IDENTITY, encoding="utf-8", errors="replace"):
+            cells = [c.strip().strip("*` ") for c in line.split("|")]
+            if len(cells) >= 4 and cells[1] and cells[2] and not set(cells[2]) <= set("-: "):
+                identity[cells[1].lower()] = cells[2]
+
+    for dirpath, dirnames, filenames in os.walk(ENG_ROOT):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        if "approved_TTPs.yaml" not in filenames:
+            continue
+        rel = os.path.relpath(dirpath, ENG_ROOT)
+        try:
+            prof = yaml.safe_load(open(os.path.join(dirpath, "approved_TTPs.yaml"),
+                                       encoding="utf-8")) or {}
+        except Exception as exc:                                  # noqa: BLE001 - report, never raise
+            problems.append({"engagement": rel, "problem": f"profile unreadable: {exc}"})
+            continue
+
+        hdr = ((prof.get("operational_constraints") or {}).get("identification_header") or {})
+        name, value = hdr.get("name"), hdr.get("value")
+        if not name or not value:
+            problems.append({"engagement": rel,
+                             "problem": "no identification header recorded in the profile"})
+            continue
+
+        # 1. Against the program's own words.
+        try:
+            det = detect_identification_header(rel)
+            if det["found"] and not any(h.lower() == name.lower() for h in det["found"]):
+                problems.append({"engagement": rel, "problem": "header NAME does not match the "
+                                 "program's text", "configured": name,
+                                 "program_asks_for": det["found"]})
+        except ScopeError:
+            pass                                                  # no captured text; §2 covers it
+
+        # 2. The platform prefix must match the engagement's own platform directory.
+        parts = rel.replace(os.sep, "/").split("/")
+        platform = parts[1] if parts and parts[0] == "programs" and len(parts) > 1 else None
+        if platform and platform.lower() not in value.lower().replace(" ", ""):
+            other = "intigriti" if platform.lower() == "hackerone" else "hackerone"
+            if other in value.lower():
+                problems.append({"engagement": rel,
+                                 "problem": "header VALUE names the WRONG platform",
+                                 "value": value, "engagement_platform": platform})
+
+        # 3. The handle must be the one on file for that platform.
+        want = identity.get((platform or "").lower())
+        if want and want not in value:
+            problems.append({"engagement": rel, "problem": "handle does not match "
+                             "operator-identity.md", "value": value, "expected_handle": want})
+        if "ASK_OPERATOR" in value or "<" in value:
+            problems.append({"engagement": rel, "problem": "placeholder handle still in the header",
+                             "value": value})
+
+        # 4. Every command that actually reaches the TARGET carries it, on the right process.
+        for t in (prof.get("approved_ttps") or []):
+            for c in (t.get("commands") or []):
+                for binary in (t.get("binaries") or []):
+                    if binary not in TOOL_BINARIES or _no_target_traffic(binary, c):
+                        continue
+                    if not re.search(rf"(^|[\s/`]){re.escape(binary)}\s", c):
+                        continue
+                    _seg, head = _command_segment(c, binary)
+                    if name not in c:
+                        problems.append({"engagement": rel, "problem": "web command emits NO "
+                                         "attribution header", "ttp": t["id"], "binary": binary})
+                    elif name not in head:
+                        problems.append({"engagement": rel, "problem": "header lands after a pipe "
+                                         "or redirect, attached to the wrong process",
+                                         "ttp": t["id"], "binary": binary})
+    return problems
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("audit-headers", help="re-verify the attribution header on EVERY engagement")
     for name in ("compile", "approve", "verify", "show"):
         s = sub.add_parser(name)
         s.add_argument("engagement")
@@ -888,6 +1068,11 @@ def main(argv=None):
         if name == "approve":
             s.add_argument("--by", required=True)
     a = p.parse_args(argv)
+    if a.cmd == "audit-headers":
+        found = audit_headers()
+        print(json.dumps({"engagements_checked": "all compiled",
+                          "problems": found}, indent=2))
+        return 1 if found else 0
     try:
         if a.cmd == "compile":
             cfg = json.load(open(os.path.expanduser(a.config), encoding="utf-8"))

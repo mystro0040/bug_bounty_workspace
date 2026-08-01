@@ -490,8 +490,159 @@ def test_every_engagement_gets_a_ledger():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_a_separator_inside_a_payload_is_not_a_new_command():
+    """A command-injection proof carries `;` or `|` INSIDE its payload. Splitting on it cuts the
+    command in half, so the header that follows looks attached to a different process — which is
+    how a correct lab profile got flagged as broken."""
+    print("[parse] shell separators inside quotes are part of the argument, not a new command")
+    cmd = ('curl -s "http://127.0.0.1:8000/lab/" --data-urlencode "host=127.0.0.1; id" '
+           '-H "X-Bug-Bounty: HackerOne-mystro0040"')
+    seg, head = SC._command_segment(cmd, "curl")
+    chk("the whole command is one segment", "--data-urlencode" in seg and "-H" in seg, seg[:90])
+    chk("the header is seen as attached to curl", "X-Bug-Bounty" in head, head[:90])
+
+    piped = 'curl -s "https://h/?x=a|b" | jq .'
+    seg2, head2 = SC._command_segment(piped, "curl")
+    chk("a pipe inside a quoted value does not split", "?x=a|b" in seg2, seg2[:90])
+    chk("but a REAL pipe still ends the segment", "jq" not in head2, head2[:90])
+
+    joined = "".join(SC._split_outside_quotes(cmd, keep=True))
+    chk("keep=True rejoins byte-identically", joined == cmd, joined[:90])
+
+    # CONTROL: real separators outside quotes must still split, or _inject_all would stop
+    # flagging the second tool in a chain — the exact bug the splitter was built to fix.
+    parts = [p for p in SC._split_outside_quotes("katana -u https://h | gau h && ffuf -u https://h")
+             if p.strip()]
+    chk("CONTROL: three chained tools still split into three", len(parts) == 3, parts)
+
+
+def _header_engagement(platform, header_name, header_value, ttps, program_text="Program rules\n"):
+    """A minimal compiled-looking engagement, planted under the given platform directory.
+
+    audit_headers() reads profiles off disk rather than compiling, which is the point — it has to
+    catch a profile that is stale, hand-edited, or older than the compile-time check.
+    """
+    base = os.path.join(SC.ENG_ROOT, "programs", platform)
+    os.makedirs(base, exist_ok=True)
+    d = tempfile.mkdtemp(prefix="_hdrtest-", dir=base)
+    os.makedirs(os.path.join(d, "_program-data"), exist_ok=True)
+    with open(os.path.join(d, "_program-data", "info.txt"), "w", encoding="utf-8") as fh:
+        fh.write(program_text)
+    with open(os.path.join(d, "scope.md"), "w", encoding="utf-8") as fh:
+        fh.write("in scope: app.example-target.com\n")
+    prof = {
+        "engagement": os.path.basename(d),
+        "operational_constraints": {"identification_header": {"name": header_name,
+                                                              "value": header_value}},
+        "approved_ttps": ttps,
+    }
+    import yaml
+    with open(os.path.join(d, "approved_TTPs.yaml"), "w", encoding="utf-8") as fh:
+        yaml.safe_dump(prof, fh, sort_keys=False)
+    rel = os.path.relpath(d, SC.ENG_ROOT)
+    return rel, d
+
+
+def _mine(rel):
+    return [p for p in SC.audit_headers() if p["engagement"] == rel]
+
+
+def test_header_audit_catches_a_wrong_header():
+    """The check must FAIL on a bad profile. A clean run proves nothing otherwise."""
+    print("[headers] the audit catches every way the header goes wrong")
+    made = []
+    try:
+        # Wrong platform in the value — the copy-paste failure between two live engagements.
+        rel, d = _header_engagement("hackerone/bounty", "X-Bug-Bounty",
+                                    "Intigriti-mystro00040", [])
+        made.append(d)
+        probs = _mine(rel)
+        chk("a HackerOne engagement carrying an Intigriti value is caught",
+            any("WRONG platform" in p["problem"] for p in probs), probs)
+
+        # Placeholder handle.
+        rel, d = _header_engagement("hackerone/bounty", "X-Bug-Bounty", "HackerOne-ASK_OPERATOR", [])
+        made.append(d)
+        chk("a placeholder handle is caught",
+            any("placeholder" in p["problem"] for p in probs2)
+            if (probs2 := _mine(rel)) else False, _mine(rel))
+
+        # Header NAME contradicting the program's own captured words.
+        rel, d = _header_engagement(
+            "hackerone/bounty", "X-Bug-Bounty", "HackerOne-mystro0040", [],
+            program_text="All traffic must carry the X-HackerOne-Research header.\n")
+        made.append(d)
+        probs = _mine(rel)
+        chk("a name the program does not ask for is caught",
+            any("NAME does not match" in p["problem"] for p in probs), probs)
+
+        # A target-bound command with no header at all.
+        rel, d = _header_engagement(
+            "hackerone/bounty", "X-Bug-Bounty", "HackerOne-mystro0040",
+            [{"id": "t1", "binaries": ["curl"],
+              "commands": ["curl -s https://app.example-target.com/"]}])
+        made.append(d)
+        probs = _mine(rel)
+        chk("an unattributed request to the target is caught",
+            any("NO attribution header" in p["problem"] for p in probs), probs)
+
+        # Present in the string but attached to the wrong process.
+        rel, d = _header_engagement(
+            "hackerone/bounty", "X-Bug-Bounty", "HackerOne-mystro0040",
+            [{"id": "t2", "binaries": ["curl"],
+              "commands": ['curl -s https://app.example-target.com/ | jq . '
+                           '> o.json -H "X-Bug-Bounty: HackerOne-mystro0040"']}])
+        made.append(d)
+        probs = _mine(rel)
+        chk("a header landing after a redirect is caught",
+            any("wrong process" in p["problem"] for p in probs), probs)
+    finally:
+        for d in made:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def test_header_audit_does_not_cry_wolf():
+    """Controls. Flagging correct behaviour is how a check gets ignored."""
+    print("[headers] traffic that never reaches the target is NOT flagged")
+    made = []
+    try:
+        good = "HackerOne-mystro0040"
+        for label, ttp in (
+            ("a recon-source lookup",
+             {"id": "r1", "binaries": ["curl"],
+              "commands": ['curl -s "https://crt.sh/?q=%25.example-target.com&output=json"']}),
+            ("an offline local tool",
+             {"id": "r2", "binaries": ["gf"], "commands": ["cat urls.txt | gf ssrf | sort -u"]}),
+            ("a third-party archive source",
+             {"id": "r3", "binaries": ["gau"], "commands": ["gau --subs example-target.com"]}),
+            ("our own out-of-band listener",
+             {"id": "r4", "binaries": ["interactsh-client"], "commands": ["interactsh-client -v"]}),
+            ("a tool updating its own templates",
+             {"id": "r5", "binaries": ["nuclei"], "commands": ["nuclei -update-templates"]}),
+        ):
+            rel, d = _header_engagement("hackerone/bounty", "X-Bug-Bounty", good, [ttp])
+            made.append(d)
+            probs = [p for p in _mine(rel) if "header" in p["problem"]]
+            chk("%s is not flagged" % label, not probs, probs)
+
+        # And the positive control: a REAL target request in the same shape IS still required to
+        # carry it, so the exemptions above narrowed the check rather than gutting it.
+        rel, d = _header_engagement(
+            "hackerone/bounty", "X-Bug-Bounty", good,
+            [{"id": "r6", "binaries": ["curl"],
+              "commands": ['curl -s "https://app.example-target.com/?q=1"']}])
+        made.append(d)
+        chk("CONTROL: a real target request with no header is still caught",
+            any("NO attribution header" in p["problem"] for p in _mine(rel)), _mine(rel))
+    finally:
+        for d in made:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     for t in (test_pending_by_default, test_constraints_are_carried_not_asserted,
+              test_a_separator_inside_a_payload_is_not_a_new_command,
+              test_header_audit_catches_a_wrong_header, test_header_audit_does_not_cry_wolf,
               test_access_state_is_never_a_curation_input, test_every_engagement_gets_a_ledger,
               test_program_rate_ceiling_beats_the_library,
               test_every_tool_in_a_chain_is_flagged, test_self_check_does_not_cry_wolf,

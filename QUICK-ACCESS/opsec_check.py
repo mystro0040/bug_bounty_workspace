@@ -318,6 +318,40 @@ def check_attribution_identity():
            % ", ".join(platforms), path)
 
 
+def check_attribution_header_matches_program():
+    """The header is right FOR THIS PROGRAM — a hard check, re-run every session.
+
+    Not the same question as check_attribution_identity, which only asks whether a handle is on
+    file. This one re-verifies each compiled engagement's header against the program's own captured
+    words, against the platform the engagement actually belongs to, and against the handle on file,
+    and confirms every target-bound command carries it attached to the right process.
+
+    It FAILS rather than warns. Traffic sent under a header the program does not look for is
+    unattributed as far as they are concerned, some programs make a missing header
+    reward-impacting, and a report claiming otherwise is claiming something untrue. The compile-time
+    check covers the moment a profile is built; a program can change its policy afterwards and
+    nothing recompiles, which is exactly the gap this closes.
+    """
+    compiler = os.path.join(BUCKET, "global", "scope", "scope_compiler.py")
+    if not os.path.exists(compiler):
+        return record("attribution header", UNKNOWN, "scope_compiler.py not found", compiler)
+    p = run([sys.executable, compiler, "audit-headers"], timeout=180)
+    out = (p.stdout or "") + (p.stderr or "")
+    if p.returncode == 0:
+        return record("attribution header", OK,
+                      "every compiled engagement's header matches its program, platform and handle",
+                      compiler)
+    try:
+        problems = json.loads(p.stdout).get("problems", [])
+    except Exception:                                             # noqa: BLE001
+        return record("attribution header", UNKNOWN,
+                      "the audit did not return a readable result", compiler)
+    first = problems[0] if problems else {}
+    record("attribution header", FAIL,
+           "%d problem(s) — e.g. %s: %s" % (len(problems), first.get("engagement", "?"),
+                                            first.get("problem", "?")), compiler)
+
+
 def check_ttp_promotion_loop():
     """Are engagement discoveries actually reaching the master library?
 
@@ -395,6 +429,7 @@ CHECKS = [
     check_ram,
     check_portable_context,
     check_attribution_identity,
+    check_attribution_header_matches_program,
     check_ttp_promotion_loop,
 ]
 

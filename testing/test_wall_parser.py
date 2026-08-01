@@ -133,6 +133,17 @@ for name, cmd in [
     ("wheel filename", "ls dist/pkg-1.2.3-py3-none-any.whl"),
     ("signature + checksum files", "ls release.tar.zst release.sig release.asc"),
     ("package files", "ls build/app.deb build/app.rpm build/app.apk"),
+    # A result pulled home from the executor is `<name>.cms` (ENC_SUFFIX in
+    # execution/remote_data.py). Reading one was DENIED on 2026-07-31 with
+    # "cms is outside the approved asset scope" - the filename parsed as an FQDN,
+    # which breaks reading results on every engagement that dispatches remotely.
+    ("encrypted artifact filename", "python3 decrypt_pulled.py probe03-authz.json.cms"),
+    ("several encrypted artifacts", "python3 d.py a-routes.json.cms b-results.json.cms"),
+    # §2F-LOCAL REQUIRES this wrapper on any pass that could fan out - one unbounded grep
+    # reached 3.96 GB and nearly froze the box. The wall denied `ulimit` as an unapproved
+    # binary, so obeying the framework's own safety rule got you blocked (2026-08-01).
+    ("the §2F-LOCAL memory cap", "( ulimit -v 2000000; grep -rn foo saved/ )"),
+    ("the cap in front of a real pipeline", "( ulimit -v 2000000; grep -rho bar js/ | sort -u )"),
 ]:
     d, why = decide(cmd)
     check(name, d == "allow", why[:70])
@@ -155,6 +166,15 @@ for name, cmd in [
     ("inside an UNBALANCED substitution", "R=$(" + CURL + " " + EVIL),
     ("nested substitution", "R=$(echo $(" + CURL + " " + EVIL + "))"),
     ("deny-listed binary", "hydra -l a -P b ssh://x"),
+    # The CONTROL for the `.cms` extension fix above. A bare out-of-scope hostname sitting
+    # in exactly the same argument position must still be denied - otherwise the fix would
+    # have widened the asset boundary instead of narrowing the parse.
+    ("bare FQDN in the same argument slot", "python3 decrypt_pulled.py evil.example.com"),
+    ("real host wearing a file-ish name", CURL + " https://evil.example.com/a.json.cms"),
+    # CONTROLS for allowing `ulimit`. Wrapping something in the memory cap must not launder it:
+    # the cap governs how much RAM a process may take, never what it is allowed to touch.
+    ("network tool hidden behind the memory cap", "( ulimit -v 2000000; " + CURL + " " + EVIL + " )"),
+    ("deny-listed binary behind the memory cap", "( ulimit -v 2000000; hydra -l a -P b ssh://x )"),
 ]:
     d, why = decide(cmd)
     check(name, d == "deny", "ALLOWED — " + why[:60])
