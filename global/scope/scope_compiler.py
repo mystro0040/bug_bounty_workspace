@@ -59,12 +59,70 @@ IDENTITY = os.path.join(WORKSPACE, "global", "operator-identity.md")
 
 # Which TTP library to filter. Overridable so the pentest workspace can point at its own library
 # instead of forking this file — one implementation, two knowledge bases.
-FRAMEWORK = os.path.expanduser(os.environ.get(
-    "OPSEC_TTP_LIBRARY",
-    "~/Workspace/Production_Ready/public/Offensive_Security/bug-bounty-execution-framework/ttps"))
-if not os.path.isdir(FRAMEWORK):
-    raise SystemExit(f"scope_compiler.py: TTP library not found at {FRAMEWORK} "
-                     f"(set OPSEC_TTP_LIBRARY to override)")
+def _machine_role():
+    """`home` or `staging`, declared per machine at ~/.config/offsec/machine_role.
+
+    Absent or unrecognised reads as `staging`. The failure worth preventing is a machine acquiring
+    write access to the permanent library by accident; a machine being too cautious costs nothing.
+    """
+    try:
+        with open(os.path.expanduser("~/.config/offsec/machine_role"), encoding="utf-8") as fh:
+            for line in fh:
+                v = line.split("#", 1)[0].strip().lower()
+                if v:
+                    return v if v in ("home", "staging") else "staging"
+    except OSError:
+        pass
+    return "staging"
+
+
+def _resolve_ttp_library():
+    """Where the TTP library lives ON THIS MACHINE. Explicit, then repo, then bucket mirror.
+
+    The master library is a separate git repo, so a machine that has the bucket but not the repo —
+    the work machine — used to have no library at all and could not compile scope. The bucket now
+    carries a WORKING mirror at `<bucket>/framework/ttps` (see framework/mirror_status.py for why
+    that is not the old dead master-mirror), and this resolves to it automatically.
+
+    Order matters. The repo wins where it exists, so home always compiles from the real master and
+    can never accidentally build scope from a stale copy. The mirror is the fallback, not the
+    default.
+    """
+    env = os.environ.get("OPSEC_TTP_LIBRARY")
+    here = os.path.dirname(os.path.abspath(__file__))          # <root>/global/scope
+    root = os.path.dirname(os.path.dirname(here))              # <root>
+    repo = ("~/Workspace/Production_Ready/public/Offensive_Security/"
+            "bug-bounty-execution-framework/ttps")
+    mirror = os.path.join(root, "framework", "ttps")
+
+    # A STAGING machine always works from the bucket mirror, even if the repo happens to be cloned
+    # there. Without this the role file was half a mechanism: it stopped the mirror being stamped
+    # but not the master being EDITED, so a `git clone` on the work machine would silently move
+    # every TTP edit onto the permanent library. Nobody would ask approval for that, because from
+    # the agent's side nothing looks different — it is doing ordinary work against a file that
+    # quietly changed underneath it. Operator approval is the right gate for PROPAGATING; it
+    # cannot be the gate for this, so the machine's declared role is.
+    if _machine_role() != "home":
+        candidates = [(env, "OPSEC_TTP_LIBRARY"),
+                      (mirror, "the bucket's working mirror (this machine is staging)")]
+    else:
+        candidates = [(env, "OPSEC_TTP_LIBRARY"),
+                      (repo, "the framework repo"),
+                      (mirror, "the bucket's working mirror")]
+    for path, why in candidates:
+        if not path:
+            continue
+        full = os.path.expanduser(path)
+        if os.path.isdir(full):
+            return full, why
+    tried = " | ".join(os.path.expanduser(p) for p, _ in candidates if p)
+    raise SystemExit(f"scope_compiler.py: no TTP library found. Tried: {tried}. "
+                     f"Set OPSEC_TTP_LIBRARY, clone the framework repo, or restore the bucket "
+                     f"mirror at <bucket>/framework/ttps.")
+
+
+FRAMEWORK, FRAMEWORK_SOURCE_IS = _resolve_ttp_library()
+
 
 # ---------------------------------------------------------------- permanent constraints (Step 2c)
 DOS_DENY = [r"hping3", r"slowloris", r"slowhttptest", r"\bt50\b", r"--flood", r"\bsiege\b",

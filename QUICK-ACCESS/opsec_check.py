@@ -352,6 +352,35 @@ def check_attribution_header_matches_program():
                                             first.get("problem", "?")), compiler)
 
 
+def check_ttp_mirror():
+    """Is the bucket's working TTP library in sync, and did the other machine change it?
+
+    WARN, never FAIL, in both directions. A mirror changed at work is the system working as
+    designed — it means an upgrade is waiting to come home — and a mirror behind master is a
+    refresh owed, not an unsafe condition. Neither should stop testing.
+
+    UNKNOWN when there is no provenance stamp, because "I cannot tell whether this diverged" is
+    exactly the state that let the previous mirror rot unnoticed.
+    """
+    tool = os.path.join(BUCKET, "framework", "mirror_status.py")
+    if not os.path.exists(tool):
+        return record("TTP mirror", UNKNOWN, "framework/mirror_status.py not found", tool)
+    p = run([sys.executable, tool], timeout=120)
+    out = ((p.stdout or "") + (p.stderr or "")).strip().splitlines()
+    first = out[0] if out else ""
+    if p.returncode == 0:
+        return record("TTP mirror", OK, "in sync with the master library", tool)
+    if p.returncode == 1:
+        return record("TTP mirror", WARN,
+                      "CHANGED away from home — an upgrade is waiting for review. "
+                      "Run `mirror_status.py --diff` and read framework/UPGRADES-FROM-WORK.md",
+                      tool)
+    if p.returncode == 2:
+        return record("TTP mirror", WARN,
+                      "behind the master library — refresh it from master and re-stamp", tool)
+    record("TTP mirror", UNKNOWN, first[:120] or "state could not be determined", tool)
+
+
 def check_ttp_promotion_loop():
     """Are engagement discoveries actually reaching the master library?
 
@@ -430,6 +459,7 @@ CHECKS = [
     check_portable_context,
     check_attribution_identity,
     check_attribution_header_matches_program,
+    check_ttp_mirror,
     check_ttp_promotion_loop,
 ]
 

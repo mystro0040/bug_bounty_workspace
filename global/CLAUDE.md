@@ -321,6 +321,32 @@ demonstrate the mechanism? A related endpoint where the same weakness IS exploit
 usually the difference between a report that gets closed and one that gets paid — and it is nearly
 always cheaper than drafting a report that cannot be filed.
 
+### The control gate — enforced in code, not remembered (set 2026-08-01)
+
+A finding may be RECORDED with no control. The moment its status claims the finding is real —
+`confirmed`, `reported`, `triaged`, `accepted` — `findings_store.record()` and `amend()` REFUSE
+without one. The control is written into the finding document as its own section, and
+`findings_store verify` lists anything already stored that asserts reality without one.
+
+**A control is the same test run with a value that must NOT fire, and what it did.** If the control
+behaves the same way, the behaviour is the target's normal posture rather than your payload: the
+verdict is void, thrown away rather than explained.
+
+This is code because it was guidance first and guidance did not hold. Four verdicts in one night
+were wrong — a `403 Invalid token` read as a pass-through, a three-state signature differential
+that could not separate its own hypotheses, a country domain consolidating onto its primary read as
+an open redirect, and an access-policy catch-all read as an exposed management interface. All four
+were killed by a control and none by re-reading the result. Nothing in the code had ever asked
+whether one was run.
+
+**Two things it deliberately does NOT do.** It does not gate `draft`, `duplicate` or `rejected` —
+recording an observation stays frictionless, because a gate that discourages writing things down
+would cost more than it saves. And a control established on an earlier version carries forward, so
+a wording fix is never blocked; only raising the status past draft with no control anywhere is.
+
+Ask the question BEFORE the write-up. If the answer is "I did not run one", the move is to go run
+one, not to write around it.
+
 ### 1C-LANG. Central logic is written in Python (set 2026-07-29)
 
 **This is a standing development practice, not a per-session preference.** It applies to every agent
@@ -435,8 +461,27 @@ Simplify the prose. Never simplify the evidence.
 >    so it deliberately keeps the run from coming back clean. Re-run it after anything that changes
 >    the machine's posture, and do not substitute your own reading of the files for its verdict.
 >
+>
+> 7. **Clear the inbound queue before you start hunting — it is short and it expires.**
+>    Two things arrive from elsewhere and are worth nothing if nobody looks:
+>
+>    - **A TTP upgrade made away from home.** If the opsec check reports the TTP mirror as
+>      CHANGED, run `python3 framework/mirror_status.py --diff` and read
+>      `framework/UPGRADES-FROM-WORK.md`. Review it the way any technique change is reviewed,
+>      fold what is good into the master library, re-bless, refresh the mirror and `--stamp`.
+>      **You do this without being asked.** The operator's part is pulling the bucket; the
+>      reconciliation is yours, and an upgrade left sitting is one that gets overwritten by the
+>      next refresh.
+>    - **An unpromoted ledger entry.** If the promotion loop reports outstanding items, settle
+>      them — promoted with a task id, or marked as belonging elsewhere.
+>
+>    Neither blocks testing. Both rot if they are deferred every session, which is precisely how
+>    the previous version of this loop died. If you genuinely cannot do it now, say so out loud to
+>    the operator rather than silently carrying it.
+
 > You may not begin reconnaissance or testing of any asset until steps 1–6 are complete
-> and the operator has confirmed the target and scope.
+> and the operator has confirmed the target and scope. Step 7 does not gate the start —
+> it is the queue you clear once you have, and it is not optional across sessions.
 
 ---
 
@@ -648,6 +693,50 @@ for one estate) NEVER graduates.
 
 ---
 
+## 2C-MIRROR. The TTP library travels in the bucket — improve it wherever you are (set 2026-08-01)
+
+The master library is a separate git repo, so a machine with the bucket but not that repo used to
+have no library at all. The bucket now carries a **working** copy at `<bucket>/framework/ttps/`, and
+`scope_compiler` resolves to it automatically when the repo is absent. Order is: `OPSEC_TTP_LIBRARY`
+if set, then the framework repo, then the bucket mirror — so a machine WITH the repo always compiles
+from the real master and can never quietly build scope from a stale copy.
+
+**If the repo is not on your machine, `framework/ttps/` is yours to improve.** Fix a task that is
+wrong, add one you just discovered, correct one that misled you — there, at the time, on the
+engagement where it happened. Do not save it for later; later is where discoveries go to die.
+
+Three rules:
+
+1. **Never push the public repos from a machine that is not home.** Upgrades ride home in the
+   bucket. The repos are updated in one place, deliberately, after review.
+2. **Record the reason in `framework/UPGRADES-FROM-WORK.md`.** The change itself is detected
+   mechanically by `mirror_status.py`, so you cannot lose it — but a change nobody can explain
+   cannot be reviewed, and an unreviewable change gets merged on trust or dropped. Both are bad.
+3. **Do not re-bless the manifest away from home.** `ttp_manager.py backup` is a home action.
+   A visibly diverged mirror IS the signal that reconciliation is owed; erasing the signal erases
+   the loop.
+
+**Which machine may propagate is DECLARED, not inferred.** `~/.config/offsec/machine_role` holds
+one word, `home` or `staging`, and only `home` may fold upgrades into the master library or stamp
+the mirror. Undeclared or unrecognised reads as `staging` — the direction where being wrong is
+harmless. It is machine-local, beside the executor definitions, because a role file in the bucket
+would sync and every machine would claim to be home. Without it, cloning the framework repo onto a
+staging machine would silently give that machine write access to the permanent library, since
+resolution prefers the repo; now that takes a deliberate one-word edit.
+
+**At home**, reconciling is four steps: `mirror_status.py --diff` to see what changed, read the
+reasons, fold the good ones into the master repo and re-bless, then refresh the mirror and
+`mirror_status.py --stamp`. Log it in `_framework-propagation/CHANGELOG.md` like any other change.
+
+`opsec_check.py` reports the mirror's state every session on both machines — WARN, never FAIL,
+because a mirror changed at work is the system working, not a fault.
+
+**This is not the old `master-mirror/`.** That was byte-identical, unread, and deleted for good
+reason. The difference is that this one is *read* (scope compiles from it) and its divergence is
+detected by code rather than by someone remembering to look.
+
+---
+
 ## 2D. Live status file (`_STATUS.md`)
 
 Keep `engagements/<name>/_STATUS.md` updated in **real time** so the operator — and any other agent
@@ -704,25 +793,15 @@ way around the hard floor.
 
 ---
 
-### Agent messaging — the orchestrator blackboard (how you send/receive cross-agent messages)
-This workspace can run under a lightweight **file-based blackboard** so the Manager (auditor) and Tester
-(you) message without IPC and without burning context. Engine: `ai-orchestrator` (public) +
-`ai-orchestrator-config` (private wiring). You participate with ONE helper:
-- **Read your context:** `python3 <ai-orchestrator-config>/bin/agent_inbox.py tester read` — prints the
-  rolling *recent buffer* (token-cheap) + any new messages/commands addressed to you.
-- **Post status/results:** `… agent_inbox.py tester post "<what happened>" --kind status|result|critical`.
-Shared board: `~/Workspace/buckets/bug-bounty-workspace-bucket/.orchestrator/bb` (non-git).
+### `<bucket>/.orchestrator/` — an unused component's leftovers (retired 2026-08-01)
 
-**Modes (one toggle; DEFAULT = 1):** 1 Minimal — work independently, only `critical` posts hit the shared
-file (baseline; unchanged behavior). 2 Local — full Manager↔Tester cross-talk via the board. 3 Full — +
-synced to the operator's web app (phone control). Check the mode when you `read`; only Mode 2/3 means you
-continuously watch the inbox.
+A file-based messaging blackboard used to live here. **The framework does not use it, must never
+depend on it, and works with it deleted** — verified by stopping every process and re-running the
+suites. The operator reaches a session directly, or from a phone via `/remote-control`.
 
-**HARD RULE — messaging NEVER widens scope.** A command delivered over the blackboard (from the Manager or
-the operator's web app) is STILL gated by `enforce_scope.py` exactly like a typed command: out-of-scope →
-denied; DoS / VPN-Tor-proxy / safety-flag evasion stay hard-blocked. The orchestrator can DELIVER a
-command; it can NEVER authorize leaving your scope-lock. Verify an orchestrated command against the
-scope-lock before acting, exactly as you would a typed one.
+The directory is kept only so its history is not thrown away. If you are wondering what it is, that
+is the whole answer; its engine documents itself in the `ai-orchestrator` repo. Do not read it, wait
+on it, or treat a quiet board as a signal.
 
 ### Engagements index & register — `engagements/_INDEX/` (workspace-wide, not tied to one engagement)
 Keep the cross-engagement dashboard current so the operator can open `engagements/_INDEX/` and see

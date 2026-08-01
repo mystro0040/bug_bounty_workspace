@@ -639,9 +639,63 @@ def test_header_audit_does_not_cry_wolf():
             shutil.rmtree(d, ignore_errors=True)
 
 
+
+def test_a_staging_machine_never_edits_the_master_library():
+    """The role decides WHICH library is editable, which operator approval cannot do.
+
+    Approval is the right gate for propagating: a human decides when work goes to the repos. It
+    cannot be the gate for this, because from the agent's side nothing looks different — it is
+    doing ordinary TTP work against a file that quietly changed underneath it when someone cloned
+    the repo. So the machine's declared role picks the library, and a staging machine gets the
+    bucket mirror even when the repo is sitting right there on disk.
+    """
+    print("[role] a staging machine resolves to the mirror even with the repo present")
+    import importlib.util
+
+    def probe(role_text, tmp):
+        os.makedirs(os.path.join(tmp, "engagements"), exist_ok=True)
+        os.makedirs(os.path.join(tmp, "global", "scope"), exist_ok=True)
+        mirror = os.path.join(tmp, "framework", "ttps", "04_V")
+        os.makedirs(mirror, exist_ok=True)
+        open(os.path.join(mirror, "a.yaml"), "w").write("title: T\nsections: []\n")
+        repo = os.path.join(tmp, "fake_repo_ttps", "04_V")
+        os.makedirs(repo, exist_ok=True)
+        open(os.path.join(repo, "a.yaml"), "w").write("title: T\nsections: []\n")
+        role = os.path.join(tmp, "machine_role")
+        if role_text is not None:
+            open(role, "w").write(role_text)
+        src = open(COMPILER, encoding="utf-8").read()
+        src = src.replace(
+            'open(os.path.expanduser("~/.config/offsec/machine_role"), encoding="utf-8")',
+            f"open({role!r}, encoding='utf-8')")
+        src = src.replace(
+            'repo = ("~/Workspace/Production_Ready/public/Offensive_Security/"\n'
+            '            "bug-bounty-execution-framework/ttps")',
+            f"repo = {os.path.dirname(repo)!r}")
+        dst = os.path.join(tmp, "global", "scope", "probe.py")
+        open(dst, "w", encoding="utf-8").write(src)
+        os.environ.pop("OPSEC_TTP_LIBRARY", None)
+        spec = importlib.util.spec_from_file_location("sc_role", dst)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m.FRAMEWORK, os.path.dirname(repo), os.path.join(tmp, "framework", "ttps")
+
+    for role, expect_repo, label in (("home\n", True, "a HOME machine uses the repo"),
+                                     ("staging\n", False, "a STAGING machine uses the mirror"),
+                                     (None, False, "an UNDECLARED machine uses the mirror")):
+        d = tempfile.mkdtemp(prefix="_roleres-")
+        try:
+            got, repo, mirror = probe(role, d)
+            chk(label + (" even with the repo on disk" if not expect_repo else ""),
+                got == (repo if expect_repo else mirror), got)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     for t in (test_pending_by_default, test_constraints_are_carried_not_asserted,
               test_a_separator_inside_a_payload_is_not_a_new_command,
+              test_a_staging_machine_never_edits_the_master_library,
               test_header_audit_catches_a_wrong_header, test_header_audit_does_not_cry_wolf,
               test_access_state_is_never_a_curation_input, test_every_engagement_gets_a_ledger,
               test_program_rate_ceiling_beats_the_library,
