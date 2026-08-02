@@ -409,6 +409,45 @@ def check_ttp_promotion_loop():
     record("TTP promotion loop", UNKNOWN, "the promotion check did not run cleanly", mgr)
 
 
+def check_engagement_plan():
+    """Can the ACTIVE engagement be resumed by a session that has none of this conversation?
+
+    WARN, never FAIL — an unrecorded plan is a debt, not an unsafe condition, and it must never
+    stop testing. It is checked every session because the artifact it guards is the one that rots
+    silently: the coverage matrix was required by global/CLAUDE.md 1B for weeks and a survey on
+    2026-08-02 found one in 3 of 15 engagements, while two engagements had grown a 15 KB `_STATUS.md`
+    doing the job instead.
+
+    What it is really asking: if this session ended right now, would the next one repeat work?
+    """
+    # Resolved the same way check_engagement does: the session pin wins over the shared pointer.
+    eng = os.environ.get("AO_ENGAGEMENT")
+    pointer = os.path.join(BUCKET, ".claude", "state", "active_engagement")
+    if not eng and os.path.exists(pointer):
+        eng = open(pointer, encoding="utf-8").read().strip()
+    if not eng:
+        return record("engagement plan", UNKNOWN, "no active engagement to check", "")
+    d = os.path.join(BUCKET, "engagements", eng)
+    planner = os.path.join(HOME, "Workspace", "Production_Ready", "public", "Offensive_Security",
+                           "bug-bounty-execution-framework", "utilities", "engagement", "plan.py")
+    missing = [f for f in ("_PLAN.md", "_COVERAGE.md") if not os.path.exists(os.path.join(d, f))]
+    if missing:
+        return record("engagement plan", WARN,
+                      "%s missing for %s — run `plan.py init --engagement %s`"
+                      % (", ".join(missing), eng, eng), planner)
+    if not os.path.exists(planner):
+        return record("engagement plan", UNKNOWN, "plan.py not found", planner)
+    p = run([sys.executable, planner, "check", "--engagement", eng], timeout=60)
+    out = ((p.stdout or "") + (p.stderr or "")).strip()
+    if p.returncode == 0:
+        rows = [ln for ln in out.splitlines() if "coverage rows exercised" in ln]
+        return record("engagement plan", OK,
+                      rows[0].split(":", 1)[-1].strip() if rows
+                      else "plan and coverage present and consistent", planner)
+    first = next((ln.strip() for ln in out.splitlines() if ln.strip().startswith("[!]")), out[:120])
+    return record("engagement plan", WARN, first, planner)
+
+
 # ---------------------------------------------------------------------------------------------
 # Optional, opt-in
 # ---------------------------------------------------------------------------------------------
@@ -461,6 +500,7 @@ CHECKS = [
     check_attribution_header_matches_program,
     check_ttp_mirror,
     check_ttp_promotion_loop,
+    check_engagement_plan,
 ]
 
 GLYPH = {OK: "  OK  ", WARN: " WARN ", FAIL: " FAIL ", UNKNOWN: " ???  "}

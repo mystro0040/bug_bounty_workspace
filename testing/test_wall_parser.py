@@ -144,6 +144,21 @@ for name, cmd in [
     # binary, so obeying the framework's own safety rule got you blocked (2026-08-01).
     ("the §2F-LOCAL memory cap", "( ulimit -v 2000000; grep -rn foo saved/ )"),
     ("the cap in front of a real pipeline", "( ulimit -v 2000000; grep -rho bar js/ | sort -u )"),
+    # The earlier `ulimit` fix allowed the builtin but not the REDIRECTION the documented form
+    # carries: `2>&1` matched no redirect pattern and was read as a program named "2>&1", so the
+    # §2F-LOCAL idiom was still denied in the shape anyone actually writes it (2026-08-01).
+    ("the cap with the redirect it is written with",
+     "( ulimit -v 2000000; python3 x.py ) 2>&1 | head -5"),
+    ("attached redirect operand", "python3 x.py 2>&1"),
+    ("redirect straight to a file", "python3 x.py >out.txt"),
+    # Python attribute access is shaped exactly like a hostname. Both of these were denied as
+    # out-of-scope TARGETS on 2026-08-01, which blocked ordinary local inspection.
+    ("dotted attribute after an import", 'python3 -c "import inspect; print(inspect.signature)"'),
+    ("attribute on a local variable", 'python3 -c "d={}; print(d.get(\'x\'))"'),
+    ("module attribute without a call", 'python3 -c "import os; print(os.environ)"'),
+    # `find` is a local file utility. Denying it pushed every directory walk into a hand-rolled
+    # script for no safety gain; its one exec vector is already an INTRODUCER.
+    ("find is local file work", "find . -name '*.json'"),
 ]:
     d, why = decide(cmd)
     check(name, d == "allow", why[:70])
@@ -171,6 +186,25 @@ for name, cmd in [
     # have widened the asset boundary instead of narrowing the parse.
     ("bare FQDN in the same argument slot", "python3 decrypt_pulled.py evil.example.com"),
     ("real host wearing a file-ish name", CURL + " https://evil.example.com/a.json.cms"),
+    # THE FAIL-OPEN HOLE, found 2026-08-01. `if not expect: continue` discarded the trailing `;`,
+    # so after a command consumed the command-position flag the parser never returned to it and
+    # every binary after a semicolon went unchecked against the allow-list. This is the one bug in
+    # that pass that made the wall WEAKER rather than noisier, so it gets the most controls.
+    ("binary after a semicolon is parsed", "echo hi; hydra -l a -P b ssh://x"),
+    ("network tool after a semicolon", "echo hi; " + CURL + " " + EVIL),
+    ("binary after a semicolon mid-arguments", "ls -la /tmp; " + CURL + " " + EVIL),
+    ("two semicolons deep", "echo a; echo b; " + CURL + " " + EVIL),
+    ("after a semicolon following a redirect", "python3 x.py > out.txt; " + CURL + " " + EVIL),
+    ("after a semicolon inside a subshell", "( ulimit -v 2000000; " + CURL + " " + EVIL + " )"),
+    # CONTROLS for the python-attribute exclusion. Keying it on the import must not let a real
+    # host through just because a module of the same name was imported, and a bare out-of-scope
+    # FQDN in the same slot must still be caught.
+    ("bare host is not laundered by an import",
+     'python3 -c "import os" ; ' + CURL + " evil.example.com"),
+    ("host in a URL inside an inline snippet",
+     'python3 -c "import urllib.request; urllib.request.urlopen(\'https://evil.example.com\')"'),
+    # CONTROL for the quote-aware segment split: a REAL pipe into a network tool still denies.
+    ("real pipe into a network tool", "echo x | httpx -u https://evil.example.com"),
     # CONTROLS for allowing `ulimit`. Wrapping something in the memory cap must not launder it:
     # the cap governs how much RAM a process may take, never what it is allowed to touch.
     ("network tool hidden behind the memory cap", "( ulimit -v 2000000; " + CURL + " " + EVIL + " )"),

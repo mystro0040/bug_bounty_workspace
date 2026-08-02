@@ -77,10 +77,22 @@ DEFAULT_SAFE = {
     # the safety rule got you blocked, so the rule was quietly unusable. It is a builtin, it
     # only ever LOWERS a limit, and it cannot reach the network.
     "ulimit",
+    # `free` is named by §2F itself ("look at how much RAM is currently available, `free -m`")
+    # and denying it meant the memory guardrail's own documented command was refused. Read-only,
+    # local, reports on this machine and cannot reach a target. §2F offers /proc/meminfo as an
+    # equivalent, so this was a friction rather than a contradiction — but it is the same class as
+    # the `ulimit` and `pgrep` cases and there is no reason to leave it.
+    "free",
+    # `find` is a local, non-network file utility and is unavoidable for ordinary engagement
+    # work (locating recon output, listing evidence). Denying it pushed every directory walk
+    # into a hand-rolled python3 script for no safety gain. Its one exec vector, `-exec`, is
+    # already an INTRODUCER below, so the program `find` runs is still parsed and checked —
+    # which is why this is safe to allow and would not have been otherwise.
+    "find",
 }
 
 INTRODUCERS = {"sudo", "env", "xargs", "nohup", "nice", "time", "watch", "command", "then",
-               "do", "exec", "-exec", "-execdir", "-ok", "timeout", "stdbuf", "setsid",
+               "do", "exec", "-exec", "-execdir", "-ok", "-okdir", "timeout", "stdbuf", "setsid",
                # Shell KEYWORDS. Without these, `if [ -f x ]; then …` had `if` read as a program
                # name and denied as "not in the approved allow-list" — an ordinary conditional
                # blocked as though it were offensive tooling. They introduce a command; they are
@@ -110,7 +122,13 @@ SHELL_BUILTINS = {"]", "]]"}
 
 #: Redirection operators. The token AFTER one is a FILENAME, never a command — `while read l;
 #: do …; done < f` was denying because `<` was read as a program and then `f` as another.
-REDIRECT_RE = re.compile(r"^(?:\d?)(?:<{1,3}|>{1,2}|&>|>&|<>)$")
+#:
+#: Group 1 is an operand ATTACHED to the operator. Without it, `2>&1` matched nothing here and fell
+#: through to be read as a program named `2>&1` — which denied `( ulimit -v N; … ) 2>&1`, the exact
+#: idiom §2F-LOCAL tells you to wrap memory-hungry commands in. The earlier `ulimit` fix allowed the
+#: builtin but not the redirection the documented form carries, so the rule stayed unusable.
+#: An attached operand also means the NEXT token is a command again, not a filename to skip.
+REDIRECT_RE = re.compile(r"^(?:\d?)(?:<{1,3}|>{1,2}|&>|>&|<>)(&?[\w./-]+)?$")
 
 #: Tokens that follow an introducer but cannot possibly be a program name — a duration or a count.
 #: `timeout 60 curl …` previously read `60` as the binary and denied it, which blocked the
@@ -134,6 +152,11 @@ HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1\s*\n.*?^\s*\
 #: identically to a hostname (`orchestrator.cli`, `http.server`, `json.tool`). Matched only with
 #: python as the program so another tool's `-m` flag keeps being inspected normally.
 PY_MODULE_RE = re.compile(r"\bpython[0-9.]*\s+(?:-[A-Za-z]+\s+)*-m\s+[A-Za-z_][\w.]*")
+
+#: Modules imported inside an inline python snippet. Their attribute accesses (`os.environ`,
+#: `urllib.parse`) are shaped like hostnames and were being denied as out-of-scope targets.
+#: See the note in extract_destinations for why keying on the import is safe.
+PY_IMPORT_RE = re.compile(r"(?:^|[^\w.])(?:import|from)\s+([A-Za-z_][\w.]*)", re.M)
 
 #: The VALUE of a Cookie header. Session blobs routinely embed version strings (`1.0.1.1` in
 #: Cloudflare's `__cf_bm`) that are shaped exactly like IPv4 addresses, so scanning them for
@@ -709,8 +732,14 @@ def candidate_binaries(cmd):
             if ends_command:
                 expect = True
             continue
-        if REDIRECT_RE.match(tok):
-            skip_next = True
+        m_redir = REDIRECT_RE.match(tok)
+        if m_redir:
+            # Only skip the NEXT token when the operand is not already attached: `> f` hides a
+            # filename in the following token, `2>&1` and `>f` carry it inline and the token after
+            # them starts a fresh command.
+            skip_next = not m_redir.group(1)
+            if ends_command:
+                expect = True
             continue
         if tok in SHELL_BUILTINS:
             expect = False
@@ -732,6 +761,19 @@ def candidate_binaries(cmd):
             expect = True
             continue
         if not expect:
+            # A trailing `;` ENDS the current command, so whatever follows starts a new one — even
+            # when we were mid-arguments and not looking for a program name.
+            #
+            # Dropping this was a fail-OPEN hole, found 2026-08-01 by reading the parser and
+            # confirmed by driving the hook: `echo hi; somestrangebinary --go` was ALLOWED, because
+            # after `echo` consumed `expect`, the `;` on `hi;` was discarded here and the parser
+            # never returned to command position. Every binary after a semicolon in that state went
+            # unchecked against the allow-list. Other layers caught some cases incidentally — a
+            # target host still tripped the asset wall — but a program taking no host argument
+            # passed cleanly. This is the one bug in this pass that made the wall weaker rather
+            # than noisier.
+            if ends_command:
+                expect = True
             continue
         if ASSIGN_RE.match(tok):
             continue
@@ -782,11 +824,25 @@ def extract_destinations(cmd):
     # string — is still caught by the URL_RE pass above, and bare out-of-scope FQDNs are still caught
     # by the loop below. It only stops a filename in a URL path from being read as a target host.
     cmd_fqdn = re.sub(r"https?://[^\s\"'`>|\\]+", " ", cmd, flags=re.I)
-    for tok in FQDN_RE.findall(cmd_fqdn):
-        t = tok.lower()
+    # PYTHON ATTRIBUTE ACCESS is shaped exactly like a hostname. `inspect.signature` and `d.get`
+    # were both denied as out-of-scope targets on 2026-08-01, which blocked ordinary local
+    # inspection and made the wall fire constantly on commands that touch no network at all. Two
+    # narrow tests, neither of which weakens host detection:
+    #   * followed immediately by `(` or `[` — a call or a subscript, never a host.
+    #   * first label is a module imported in this same command — `os.environ` after `import os`.
+    # A scheme-prefixed host is still caught by the URL pass above regardless of either test, and a
+    # bare out-of-scope FQDN handed to a tool is still caught below, so neither opens a route to a
+    # target. Reaching a host requires it to appear where a request is actually made.
+    imported = {m.split(".")[0] for m in PY_IMPORT_RE.findall(cmd_fqdn)}
+    for m in FQDN_RE.finditer(cmd_fqdn):
+        t = m.group(0).lower()
         if t in dests:
             continue
         if t.rsplit(".", 1)[-1] in FILE_EXT:
+            continue
+        if cmd_fqdn[m.end():m.end() + 1] in ("(", "["):
+            continue
+        if t.split(".")[0] in imported:
             continue
         dests.add(t)
     return dests
@@ -909,8 +965,53 @@ def _normalize_paths(command):
 
 def _segments(command):
     """Split on shell separators so a write in one command isn't attributed to a read in another.
-    The `(?<!>)` guard keeps the `>|` clobber-redirect operator intact instead of splitting it."""
-    return re.split(r"&&|\|\||(?<!>)[;&|\n]", command)
+
+    QUOTE-AWARE. The previous version was a bare `re.split`, which split on separators sitting
+    INSIDE a quoted argument. That was a real defect, not a cosmetic one:
+
+        pgrep -a -f 'httpx|dnsx|nuclei|ffuf'
+
+    fragmented at each `|` inside the quoted pattern, producing a segment whose first token was
+    `dnsx`. `location_violation` then read that as "a network tool is the program being run here"
+    and refused the command — while §2F-STOP REQUIRES exactly this pgrep to verify that a stop
+    left nothing running. The wall denied a command the manual mandates, and the natural response
+    (reword until it passes) is the one move the rules forbid.
+
+    The `>|` clobber-redirect stays intact, as it did before.
+    """
+    out, buf = [], []
+    i, n, quote = 0, len(command), None
+    while i < n:
+        c = command[i]
+        if quote:
+            buf.append(c)
+            if c == quote and command[i - 1] != "\\":
+                quote = None
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+            buf.append(c)
+            i += 1
+            continue
+        if command.startswith("&&", i) or command.startswith("||", i):
+            out.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if c in ";&|\n":
+            if c == "|" and i > 0 and command[i - 1] == ">":   # `>|` clobber-redirect, not a pipe
+                buf.append(c)
+                i += 1
+                continue
+            out.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(c)
+        i += 1
+    out.append("".join(buf))
+    return out
 
 
 def _copy_writes_prod(seg, p):

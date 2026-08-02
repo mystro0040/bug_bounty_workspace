@@ -462,6 +462,18 @@ Simplify the prose. Never simplify the evidence.
 >    the machine's posture, and do not substitute your own reading of the files for its verdict.
 >
 >
+> 6B. **Load the PLAN before you touch anything — this is how you avoid repeating a past session.**
+>    ```
+>    python3 <FRAMEWORK_SOURCE repo>/utilities/engagement/plan.py next --engagement <eng>
+>    ```
+>    Then read `<engagement>/_PLAN.md` (position, next actions, parked, closed threads and WHY) and
+>    `_COVERAGE.md` (what has actually been exercised). A previous session's reasoning does not
+>    reach you any other way — the transcript is deliberately not carried across — so skipping this
+>    means re-deriving what is already known and re-running tests that already ran. See §2D-PLAN.
+>
+>    It tells you what is **untested**; it does not tell you what to do. That stays your judgement,
+>    and a better idea than anything listed should be taken first (§2B-AUGMENT).
+>
 > 7. **Clear the inbound queue before you start hunting — it is short and it expires.**
 >    Two things arrive from elsewhere and are worth nothing if nobody looks:
 >
@@ -775,6 +787,64 @@ already exist. This is the operator's single timestamped view of everything awai
 
 ---
 
+## 2D-PLAN. The plan and the coverage ledger — so a cold session RESUMES instead of restarting
+
+**The problem, stated plainly.** Everything an agent works out during a session lives in that
+session. The transcript is deliberately not carried across machines (see the portable context for
+why). So unless the reasoning is written to disk, the next conversation re-derives what was already
+known and re-runs tests that were already run. That is not hypothetical: it happened on 2026-08-01,
+and a survey the next morning found the coverage matrix — required by §1B since long before —
+present in **3 of 15** engagements, with two engagements' entire log crammed into a 15 KB
+`_STATUS.md` that §2D says must stay tiny. Three engagements contained hand-rolled substitutes
+(`temp/what-i-tested.md`, `todays-log-<date>.md`). Three agents independently inventing the same
+missing file is a specification, not a coincidence.
+
+**Two files per engagement, created for you when scope compiles** (`scope_compiler.ensure_plan`,
+the same mechanism that creates the ledger — you never make them and never skip them):
+
+- **`_PLAN.md`** — the train of thought. Current pass and position, the plan, next actions, parked
+  items, a **freestyle lane**, and closed threads *with the reason they are closed*. Written for the
+  next agent as much as for you. Hand-edit it freely.
+- **`_COVERAGE.md`** — SURFACE × CLASS → state. The anti-duplication mechanism.
+  `untested` · `running` · `clean` · `finding` · `blocked` · `walled`.
+
+**The one command a resuming session runs, before anything else:**
+
+```
+python3 <FRAMEWORK_SOURCE repo>/utilities/engagement/plan.py next --engagement <eng>
+```
+
+It answers "what has NOT been touched", which is cheap, rather than "what should I do", which is
+judgement and stays yours. `status` gives position; `cover` records a result; `check` catches work
+that happened but was never logged.
+
+**`clean` requires a REASON, and the tool refuses it without one.** "I looked and found nothing"
+ages badly and transfers to nobody. "The matched set is seeded from the authorized list and only
+ever shrinks" tells the next reader exactly what change would break it. Same for `blocked` (what
+would unblock it), `walled` (date and signal) and `finding` (the id).
+
+### This must NOT make you rigid — read this half too
+
+The best findings this workspace has produced came from looking at an application and noticing
+something no library listed. Nothing here is a gate on testing:
+
+- **Test first, record after.** There is no "fill this in before you may run a tool". A ledger that
+  costs effort at the exact moment you want to keep testing is the ledger that does not get
+  written — which is how the coverage-matrix rule died the first time.
+- **You do not need a TTP id.** `cover --freestyle` exists for your own ideas, and the freestyle
+  lane in `_PLAN.md` is a first-class section. If you can see a better angle than anything in the
+  arsenal, **take it first** and write it down after.
+- **The arsenal is the FLOOR, not the ceiling** (§2B-AUGMENT, unchanged). A surface is not dead
+  until the applicable approved TTPs are genuinely exhausted — `next` will keep saying so — and it
+  is never capped by them.
+- **Passes are iterative.** Pass 1 is written from what the surface looks like before any testing;
+  what pass 1 finds decides pass 2. Do not try to write pass 3 up front.
+
+`opsec_check.py` reports the plan's state every session as a **WARN, never a FAIL** — an
+unrecorded plan is a debt, not an unsafe condition, and it must never stop you testing.
+
+---
+
 ## 2E. Control file (`_CONTROL.md`) — how the operator/auditor hands you the next step
 
 The inbound counterpart to `_STATUS.md`. `engagements/<name>/_CONTROL.md` is where the operator (or a
@@ -1017,7 +1087,13 @@ When you pause, stop, close an engagement, or hand back to the operator, **clean
   itself after `SSH_CONTROL_PERSIST` idle, but a stop should not be something you wait out:
   `python3 <…>/execution/remote_data.py disconnect`. `remote_data.py status` reports
   `ssh_master_open` so "is anything still open?" is answerable without logging in and guessing.
-- **Verify before you report "stopped/paused":** a quick `pgrep` for your tools returns empty.
+- **Verify before you report "stopped/paused":** run `python3 QUICK-ACCESS/opsec_check.py` and read
+  its "nothing scanning here" check — it tests 13 tool names by exact process name from Python.
+  Do **NOT** verify with a raw `pgrep -f '<scanner>|<scanner>'`: scanner names are denied_patterns
+  in the engagement's scope lock, the wall matches raw command TEXT, and the check gets refused as
+  though you were launching the tool. Found 2026-08-01. The wall was deliberately NOT loosened for
+  it — exempting a deny-list for "inspection" buys bypass surface to replace a mechanism that
+  already works. Use the check that works, and never reword a denied command until it passes.
 - **Then** write `_STATUS.md` (state + a resumable checkpoint). A pause is only clean when BOTH: no
   orphaned jobs remain AND the resume state is written.
 This is not optional and not DNS-specific — it applies to every background tool, every stop.
@@ -1034,9 +1110,22 @@ take a share of the global budget instead of hardcoding a rate:
 RL=$(python3 <FRAMEWORK_SOURCE repo>/utilities/execution/rate_budget.py --for-new)
 dnsx -l cand.txt -r ~/.config/offsec/resolvers.txt -rl "$RL" -t 25 -o out.txt
 ```
-`resumable_subenum.sh` does this automatically when you pass `rate=auto` (now its default). The helper
-divides `GLOBAL_MAX_RPS` across everything running, so the SUM stays ISP-safe even with several tools /
-engagements active. Never raise a tool's rate to "go faster" past the share it returns.
+`resumable_subenum.sh` does this automatically when you pass `rate=auto` (now its default). Never
+raise a tool's rate to "go faster" past the share it returns.
+
+**How "everything running" is actually counted — corrected 2026-08-01.** This paragraph used to say
+the helper "divides `GLOBAL_MAX_RPS` across everything running, so the SUM stays ISP-safe even with
+several tools / engagements active." It did not. It scanned THIS machine's `/proc` for scanner
+process names, while the default posture below is that network tools run on the EXECUTOR, where no
+local process exists — and a manual-only engagement's entire toolset is `curl` and `python3`, which
+are not scanner names and must never be counted as such. Two concurrent remote engagements were
+each handed the full per-engagement rate and the cap divided by nothing. The prose asserted a
+division the code never performed, which is the characteristic failure here.
+
+`remote_exec.run_remote` now **declares** each dispatch for exactly the window it generates traffic
+(`rate_budget.declare`), and the divider counts declarations plus undeclared local tools. Inspect
+with `python3 <…>/execution/rate_budget.py --inflight`. A tool launched by some other route is still
+invisible to it — if you add one, declare it.
 
 **The two real residential-ISP trip-wires, and the rule for each:**
 - **Bulk DNS volume.** Keep it under the global cap. If a run genuinely needs more than the home line

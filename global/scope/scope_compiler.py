@@ -725,6 +725,42 @@ def ensure_ledger(d):
     return True
 
 
+def ensure_plan(d, engagement):
+    """Every engagement gets `_PLAN.md` and `_COVERAGE.md`, for the same reason it gets a ledger.
+
+    The anti-duplication mechanism. Without it a session's train of thought lives only in a
+    transcript that is deliberately not carried across machines, so the next session re-derives what
+    was already known and re-runs tests that were already run. Both happened on 2026-08-01.
+
+    Delegates to `utilities/engagement/plan.py`, which owns the format. Import is local and failure
+    is non-fatal: a missing planner must never stop a scope from compiling, because a scope that
+    will not compile is a locked-down engagement and that is a far worse outcome than a missing
+    plan file.
+    """
+    try:
+        fw = _resolve_ttp_library()
+        # returns (path, how) — take the path, not the tuple
+        fw = fw[0] if isinstance(fw, (tuple, list)) else fw
+        base = os.path.dirname(os.path.dirname(os.path.abspath(fw))) if fw else None
+        for cand in ([os.path.join(base, "utilities")] if base else []) + [
+                os.path.expanduser("~/Workspace/Production_Ready/public/Offensive_Security/"
+                                   "bug-bounty-execution-framework/utilities")]:
+            if os.path.isdir(os.path.join(cand, "engagement")):
+                if cand not in sys.path:
+                    sys.path.insert(0, cand)
+                break
+        from engagement import plan as _plan          # noqa: PLC0415
+        made = []
+        for f in (_plan.PLAN_FILE, _plan.COVERAGE_FILE):
+            if not os.path.exists(os.path.join(d, f)):
+                made.append(f)
+        if made:
+            _plan.main(["init", "--engagement", engagement])
+        return made
+    except Exception as exc:                                 # noqa: BLE001
+        return ["(planner unavailable: %s)" % type(exc).__name__]
+
+
 def compile_scope(engagement, cfg, update=False):
     d = eng_dir(engagement)
     ensure_ledger(d)
@@ -838,8 +874,16 @@ def compile_scope(engagement, cfg, update=False):
     with open(os.path.join(d, ".scope_lock", "enforcement.json"), "w", encoding="utf-8") as fh:
         json.dump(enforcement, fh, indent=2)
 
+    # The PLAN and COVERAGE ledger, seeded from the assets that were just compiled. Same reasoning
+    # as ensure_ledger above and the same failure it prevents: the coverage matrix has been required
+    # by global/CLAUDE.md 1B for weeks and a survey on 2026-08-02 found one in 3 of 15 engagements.
+    # Created here because every engagement is scoped, so no engagement can start without somewhere
+    # to record what has been exercised and where the thread was left.
+    plan_made = ensure_plan(d, engagement)
+
     problems = self_check(engagement)
     return {"engagement": engagement, "cached": False, "ttps": len(approved),
+            "plan_created": plan_made,
             "excluded": profile["curation"]["excluded"], "binaries": len(allowed),
             "denied_patterns": len(denied), "manual_only": manual_only,
             "automation_review": [f"{f}:{n}  {t}" for f, n, t in stance["review"][:10]],
