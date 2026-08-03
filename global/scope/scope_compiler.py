@@ -138,6 +138,45 @@ SCANNERS = {"ffuf", "nuclei", "sqlmap", "katana", "feroxbuster", "gobuster", "di
 RECON_SOURCES = ["crt.sh", "api.certspotter.com", "whois.radb.net", "github.com",
                  "api.github.com", "web.archive.org", "otx.alienvault.com", "urlscan.io"]
 
+
+def recon_sources_for(cfg):
+    """Which passive-recon hosts this engagement gets. Default: all of them.
+
+    These answer questions about a live internet-facing estate — Certificate Transparency for
+    subdomains, Wayback for historical endpoints, passive DNS, routing registries. On a normal
+    web engagement they are how you map a target without sending it a packet, so every engagement
+    gets them by default and that behaviour is unchanged.
+
+    They are dead weight on a SOFTWARE engagement. Added 2026-08-02 for a downloadable-software
+    programme, where
+    the asset is a binary downloaded and run on our own hardware: no subdomains to enumerate, no
+    historical URLs, no certificate history. Granting reach we have no use for is not neutral —
+    an allow-listed host is one the wall stops asking about.
+
+    facts.json:
+        omitted / true      -> all of RECON_SOURCES (unchanged default)
+        false               -> none
+        ["github.com", ...] -> exactly that subset
+
+    A subset is the useful middle: a local-analysis engagement still legitimately needs the tool
+    DISTRIBUTION hosts (2F-TOOLS says fetch from official upstream, which for security tooling is
+    usually a GitHub release) while having no use for Certificate Transparency.
+    """
+    v = cfg.get("recon_sources", True)
+    if v is True:
+        return list(RECON_SOURCES)
+    if v is False or v is None:
+        return []
+    if isinstance(v, (list, tuple)):
+        unknown = [h for h in v if h not in RECON_SOURCES]
+        if unknown:
+            raise ScopeError(
+                "recon_sources lists host(s) that are not recon sources: %s. This field SELECTS "
+                "from the fixed recon list; it is not a way to add arbitrary hosts. Program "
+                "assets belong in `hosts`, where they are reviewed as assets." % ", ".join(unknown))
+        return [h for h in RECON_SOURCES if h in v]
+    raise ScopeError("recon_sources must be true, false, or a list of recon hostnames")
+
 LOCAL_HELPERS = ["jq", "grep", "sed", "awk", "cat", "echo", "printf", "sort", "uniq", "tee",
                  "python3", "git", "gh", "sha256sum", "sha512sum", "file", "gpg", "wc", "head",
                  "tail", "tr", "cut", "xargs", "sleep", "date", "mkdir", "cp", "mv", "diff"]
@@ -750,12 +789,28 @@ def ensure_plan(d, engagement):
                     sys.path.insert(0, cand)
                 break
         from engagement import plan as _plan          # noqa: PLC0415
-        made = []
-        for f in (_plan.PLAN_FILE, _plan.COVERAGE_FILE):
-            if not os.path.exists(os.path.join(d, f)):
-                made.append(f)
-        if made:
-            _plan.main(["init", "--engagement", engagement])
+        wanted = [f for f in (_plan.PLAN_FILE, _plan.COVERAGE_FILE)
+                  if not os.path.exists(os.path.join(d, f))]
+        if not wanted:
+            return []
+        # Pass the root we are ACTUALLY compiling in. plan.py otherwise falls back to a hardcoded
+        # bucket path, so a compile rooted anywhere else (a fresh repo clone, a test tree) silently
+        # wrote nothing — plan.py looked for the engagement under the bucket and did not find it.
+        # `--bucket` is a TOP-LEVEL argument, so it has to precede the subcommand.
+        argv = []
+        suffix = os.path.join("engagements", engagement)
+        if d.endswith(suffix):
+            argv += ["--bucket", d[:-len(suffix)].rstrip(os.sep)]
+        _plan.main(argv + ["init", "--engagement", engagement])
+        # Verify, do not assume. `plan.py init` resolves the engagement path ITSELF, so it can write
+        # somewhere other than `d` — or decline outright ("no such engagement") — while the old code
+        # returned the list of files it INTENDED to create either way. compile_scope puts that value
+        # straight into `plan_created`, so a silent no-op read back as success. Found 2026-08-02 by a
+        # test that ran the compiler outside the bucket, where the resolution genuinely diverges.
+        made = [f for f in wanted if os.path.exists(os.path.join(d, f))]
+        missed = [f for f in wanted if f not in made]
+        if missed:
+            return ["(planner created nothing for: %s)" % ", ".join(missed)]
         return made
     except Exception as exc:                                 # noqa: BLE001
         return ["(planner unavailable: %s)" % type(exc).__name__]
@@ -800,16 +855,6 @@ def compile_scope(engagement, cfg, update=False):
                 gated[k] = gated.get(k, 0) + 1
         approved.append(entry)
 
-    for t in load_tasks():
-        ok, why = relevant(t, caps, manual_only)
-        if not ok:
-            excluded[why] = excluded.get(why, 0) + 1
-            continue
-        entry = {k: t[k] for k in ("id", "technique", "phase", "intent", "poc_only", "binaries")}
-        entry["commands"] = emit_commands(t, cfg)
-        entry["source"] = "framework"
-        approved.append(entry)
-
     used = set()
     for t in approved:
         used |= set(t["binaries"])
@@ -826,7 +871,7 @@ def compile_scope(engagement, cfg, update=False):
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "source_scope_file": os.path.basename(scope_file),
         "source_scope_sha256": sha,
-        "assets": {"hosts": cfg["hosts"] + RECON_SOURCES,
+        "assets": {"hosts": cfg["hosts"] + recon_sources_for(cfg),
                    "wildcards": cfg.get("wildcards", []), "cidrs": [], "ips": [],
                    "endpoints": cfg.get("endpoints", []),
                    "out_of_scope": cfg.get("out_of_scope", [])},
@@ -1035,11 +1080,6 @@ def show(engagement):
 OFFLINE_TOOLS = {"gf", "qsreplace", "semgrep", "whois"}
 ELSEWHERE_TOOLS = {"gau", "waybackurls", "interactsh-client"}
 _URL_HOST_RX = re.compile(r"https?://([A-Za-z0-9.-]+)")
-#: Flags that hand a tool something to aim at — a host, a URL, a domain, or a file of them.
-_TARGET_INPUT_RX = re.compile(r"(^|\s)-{1,2}(l|u|d|i|list|url|urls|target|targets|host|domain)"
-                              r"(\s|=)")
-
-
 #: Flags that hand a tool something to aim at — a host, a URL, a domain, or a file of them.
 _TARGET_INPUT_RX = re.compile(r"(^|\s)-{1,2}(l|u|d|i|list|url|urls|target|targets|host|domain)"
                               r"(\s|=)")

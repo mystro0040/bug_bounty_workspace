@@ -241,6 +241,28 @@ HARDCODED_DENY = [
     # program's own limit are enforced above this; this is only the un-crossable floor.
     r"-rate\s+\d{3,}", r"-rl\s+\d{3,}", r"--rate-limit[=\s]\d{3,}",
     r"--threads[=\s]\d{3,}", r"-t\s+\d{3,}",
+    # ── The two Anthropic accounts never mix (added 2026-08-02, operator's directive) ──
+    #
+    # The operator holds a Claude subscription (this session) and, separately, an API token that
+    # bills per request. Engagement work is dispatched to the executor over SSH; it must NEVER be
+    # done by spending API tokens instead. The concern is not that an agent would do it deliberately
+    # — it is that "run some recon" could quietly become billable API calls and nobody would notice
+    # until the invoice.
+    #
+    # Before this, all five ways of doing it were already refused, but for INCIDENTAL reasons: curl
+    # was blocked because execution resolves to remote, `claude` because it is not in this
+    # engagement's allow-list, the python one-liner because the host is off-scope. Change the
+    # execution mode, or approve `claude` in some future profile, and those reasons evaporate. None
+    # of them said "spending the token is categorically not a thing you may do." Now one does.
+    #
+    # Scope note: this bans SPENDING the token, not discussing it. The floor matches command TEXT,
+    # so reading or writing files that merely mention a key name is unaffected — `opsec_check.py`
+    # still runs, and it is what verifies no key is present on this machine in the first place.
+    r"\bapi\.anthropic\.com\b",                       # the only endpoint that spends tokens
+    r"\bsk-ant-[A-Za-z0-9_\-]{6,}",                   # real key material in a command line
+    r"\bANTHROPIC_API_KEY\s*=",                       # handing a key to a process
+    r"\$\{?ANTHROPIC_API_KEY\b",                      # ...or passing the one already in the env
+    r"\bclaude\b[^\n]*\s(?:-p|--print)\b",            # driving Claude non-interactively
 ]
 
 
@@ -1141,6 +1163,15 @@ def main():
     for pat in HARDCODED_DENY:
         try:
             if re.search(pat, command, re.I):
+                # Name the category that actually matched. "DoS / brute-force / destructive" on an
+                # Anthropic-billing denial reads as a bug in the wall, and a denial nobody
+                # understands is one somebody tries to work around.
+                if "anthropic" in pat.lower() or "sk-ant" in pat.lower() or "claude" in pat.lower():
+                    emit("deny",
+                         "HARD FLOOR: engagement work is never done by spending the API token. The "
+                         "subscription and the API account are kept separate, and tools run on the "
+                         "executor via run_remote. If you need this, it is an operator decision — "
+                         "do not reword the command.")
                 emit("deny", "Blocked by a HARD-CODED, always-on ban (DoS / credential brute-forcing "
                              "/ destructive). Never permitted in any mode or engagement.")
         except re.error:

@@ -205,6 +205,61 @@ def main():
               state_of(rep, "check_ram") == "FAIL", str(rep)[:200])
         check("a crashing check makes the run not clean", rep["clean"] is False)
 
+    # ---------------------------------------------------------------------------------------
+    # The engagement-plan check (§2D-PLAN). Its contract is WARN, never FAIL — an unrecorded plan
+    # is a debt, not an unsafe condition, and it must never stop testing. `clean` is
+    # `no FAIL and no UNKNOWN`, so "never blocks" means neither state may appear here.
+    print("\nthe engagement plan (a debt-class check — it must never block a session)")
+
+    def plan_files(bucket, engagement="programs/test/eng", planner=None, rc=0, out=""):
+        d = os.path.join(bucket, "engagements", engagement)
+        os.makedirs(d, exist_ok=True)
+        for f in ("_PLAN.md", "_COVERAGE.md"):
+            with open(os.path.join(d, f), "w") as fh:
+                fh.write("# %s\n" % f)
+        if planner is not None:
+            p = os.path.join(planner, "Workspace", "Production_Ready", "public",
+                             "Offensive_Security", "bug-bounty-execution-framework",
+                             "utilities", "engagement")
+            os.makedirs(p, exist_ok=True)
+            with open(os.path.join(p, "plan.py"), "w") as fh:
+                fh.write("import sys\nprint(%r)\nsys.exit(%d)\n" % (out, rc))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        home, bucket = build(tmp)
+        rep, _ = run(bucket, home)
+        check("it is registered and actually runs", state_of(rep, "engagement plan") is not None,
+              str(rep)[:200])
+        check("plan files missing -> WARN", state_of(rep, "engagement plan") == "WARN")
+
+    # The regression this exists for: the plan files travel in the bucket, plan.py lives in the
+    # framework repo. A machine holding one without the other returned UNKNOWN, and UNKNOWN blocks
+    # the session — the one thing this check promises never to do.
+    with tempfile.TemporaryDirectory() as tmp:
+        home, bucket = build(tmp)
+        plan_files(bucket)
+        rep, _ = run(bucket, home)
+        st = state_of(rep, "engagement plan")
+        check("plan present but plan.py absent -> WARN, never UNKNOWN", st == "WARN", st)
+        check("...so it cannot block a session that is otherwise clean",
+              st not in ("FAIL", "UNKNOWN"), st)
+
+    # CONTROL: with a working planner that reports a problem it must still be WARN — and with one
+    # that reports success it must be OK. Without these, "always WARN" would pass the check above.
+    with tempfile.TemporaryDirectory() as tmp:
+        home, bucket = build(tmp)
+        plan_files(bucket, planner=home, rc=1, out="[!] 20 artifacts and nothing recorded")
+        rep, _ = run(bucket, home)
+        st = state_of(rep, "engagement plan")
+        check("control — planner reports a problem -> WARN, not FAIL", st == "WARN", st)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        home, bucket = build(tmp)
+        plan_files(bucket, planner=home, rc=0, out="coverage rows exercised: 7 of 12")
+        rep, _ = run(bucket, home)
+        st = state_of(rep, "engagement plan")
+        check("control — a healthy plan -> OK (so WARN above means something)", st == "OK", st)
+
     with tempfile.TemporaryDirectory() as tmp:
         home, bucket = build(tmp)
         rep, _ = run(bucket, home)

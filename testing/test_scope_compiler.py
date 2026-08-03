@@ -490,6 +490,104 @@ def test_every_engagement_gets_a_ledger():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_every_engagement_gets_a_plan():
+    """§2D-PLAN's anti-duplication mechanism has the same failure mode the coverage matrix already
+    had once: it works only if nobody has to remember it. So the compiler creates both files, and
+    this asserts it — the behaviour shipped 2026-08-01 with no test at all, and the drift check is
+    what surfaced that the next morning."""
+    print("[plan] compiling scope creates the plan and the coverage ledger")
+    name, d = temp_engagement()
+    plan = os.path.join(d, "_PLAN.md")
+    coverage = os.path.join(d, "_COVERAGE.md")
+    try:
+        chk("no plan before compiling", not os.path.exists(plan))
+        chk("no coverage ledger before compiling", not os.path.exists(coverage))
+        res = SC.compile_scope(name, dict(BASE_CFG), update=True)
+        chk("the plan exists after compiling", os.path.exists(plan))
+        chk("the coverage ledger exists after compiling", os.path.exists(coverage))
+        chk("the result reports that it made one", res.get("plan_created") is not False, res.get("plan_created"))
+
+        # The plan is the train of thought — a recompile that wiped it would destroy exactly what
+        # it exists to carry across sessions.
+        with open(plan, "a", encoding="utf-8") as fh:
+            fh.write("\n## sentinel thread\n")
+        with open(coverage, "a", encoding="utf-8") as fh:
+            fh.write("\n| sentinel-surface | idor | clean | seeded from the authorized list |\n")
+        SC.compile_scope(name, dict(BASE_CFG), update=True)
+        chk("a second compile does NOT overwrite the plan",
+            "sentinel thread" in open(plan, encoding="utf-8").read())
+        chk("a second compile does NOT overwrite the coverage ledger",
+            "sentinel-surface" in open(coverage, encoding="utf-8").read())
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_plan_creation_never_claims_success_it_did_not_achieve():
+    """`plan_created` is read as a statement of fact by whoever compiled the scope. It must never
+    report files it did not actually produce.
+
+    The old code built its return value from what was MISSING before the call and never looked
+    again. `plan.py init` resolves the engagement path itself, so when it wrote elsewhere — or
+    declined with "no such engagement" — the caller still got `['_PLAN.md', '_COVERAGE.md']` back.
+    That is the house failure mode exactly: a claim outrunning what the code did."""
+    print("[plan] the return value reflects what was CREATED, not what was intended")
+    d = tempfile.mkdtemp()
+    try:
+        # An engagement path the planner cannot resolve -> it creates nothing.
+        res = SC.ensure_plan(d, "programs/definitely/not/a/real/engagement")
+        made_files = sorted(os.listdir(d))
+        chk("nothing was actually created", made_files == [], made_files)
+        chk("and it does NOT claim the files were made",
+            not (set(res) >= {"_PLAN.md", "_COVERAGE.md"}), res)
+        chk("it says the planner produced nothing", any("nothing" in str(x) for x in res), res)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_the_task_loop_runs_exactly_once():
+    """A duplicated `for t in load_tasks()` block shipped in the public repo on 2026-08-02 and
+    appended every approved technique twice. The binaries set is a union so nothing widened, but the
+    profile and its counts were wrong and the duplicates carried no gating annotation. Nothing
+    noticed, because no test had ever asserted that an id appears once."""
+    print("[compile] every approved technique appears exactly once")
+    name, d = temp_engagement()
+    try:
+        SC.compile_scope(name, dict(BASE_CFG), update=True)
+        with open(os.path.join(d, "approved_TTPs.yaml"), encoding="utf-8") as fh:
+            prof = yaml.safe_load(fh)
+        ids = [t["id"] for t in (prof.get("approved_ttps") or prof.get("approved") or [])]
+        dupes = sorted({i for i in ids if ids.count(i) > 1})
+        chk("no technique id is duplicated", not dupes, "duplicated: %s" % dupes[:8])
+        chk("the profile is non-empty (or the check above is vacuous)", len(ids) > 0, len(ids))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_plan_creation_never_breaks_a_compile():
+    """A plan is a convenience; a scope lock is a safety boundary. If the planner is unreachable the
+    compile must STILL produce the lock — the alternative is an engagement with no wall because a
+    markdown file could not be written.
+
+    Note this breaks something ensure_plan DEPENDS on rather than replacing ensure_plan itself.
+    Patching the function wholesale removes the very try/except under test and proves only that a
+    monkeypatch raises, which is what the first version of this test did."""
+    print("[plan] an unreachable planner does not take the scope lock with it")
+    name, d = temp_engagement()
+    real = SC._resolve_ttp_library
+    SC._resolve_ttp_library = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+    try:
+        res = SC.compile_scope(name, dict(BASE_CFG), update=True)
+        chk("the compile still succeeded", bool(res))
+        chk("the scope lock was still written",
+            os.path.exists(os.path.join(d, ".scope_lock", "enforcement.json")))
+        chk("and it says the planner was unavailable rather than claiming success",
+            any("unavailable" in str(x) for x in (res.get("plan_created") or [])),
+            res.get("plan_created"))
+    finally:
+        SC._resolve_ttp_library = real
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_a_separator_inside_a_payload_is_not_a_new_command():
     """A command-injection proof carries `;` or `|` INSIDE its payload. Splitting on it cuts the
     command in half, so the header that follows looks attached to a different process — which is
@@ -692,18 +790,88 @@ def test_a_staging_machine_never_edits_the_master_library():
             shutil.rmtree(d, ignore_errors=True)
 
 
+def test_recon_sources_are_selectable_not_extendable():
+    """Passive-recon hosts are optional, and the field cannot smuggle arbitrary hosts.
+
+    Added 2026-08-02. Every engagement got the full recon allow-list — Certificate Transparency,
+    Wayback, passive DNS, urlscan, the routing registry — because every engagement was assumed to
+    be a live internet-facing estate. A SOFTWARE program (a binary we download and run on our own
+    hardware) has no subdomains, no historical URLs and no certificate history, so those hosts
+    were reach we had no use for.
+
+    The security-relevant half is the LAST check. `recon_sources` SELECTS from a fixed list; if it
+    could add hosts, it would be a second door into the asset boundary that bypasses the review
+    that `hosts` gets. It must fail closed on anything unrecognised.
+    """
+    print("[compile] recon sources: default all, suppressible, never a way in")
+    RS = set(SC.RECON_SOURCES)
+
+    name, d = temp_engagement()
+    try:
+        SC.compile_scope(name, dict(BASE_CFG), update=True)
+        enf = json.load(open(os.path.join(d, ".scope_lock", "enforcement.json"), encoding="utf-8"))
+        chk("omitted -> every recon source, unchanged default",
+            RS.issubset(set(enf["assets"]["hosts"])))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    name, d = temp_engagement()
+    try:
+        cfg = dict(BASE_CFG); cfg["recon_sources"] = False
+        SC.compile_scope(name, cfg, update=True)
+        hosts = json.load(open(os.path.join(d, ".scope_lock", "enforcement.json"),
+                               encoding="utf-8"))["assets"]["hosts"]
+        chk("false -> no recon source survives", not (RS & set(hosts)), sorted(RS & set(hosts)))
+        chk("false -> the program's own hosts are untouched", "app.example-target.com" in hosts)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    name, d = temp_engagement()
+    try:
+        cfg = dict(BASE_CFG); cfg["recon_sources"] = ["github.com"]
+        SC.compile_scope(name, cfg, update=True)
+        hosts = set(json.load(open(os.path.join(d, ".scope_lock", "enforcement.json"),
+                                   encoding="utf-8"))["assets"]["hosts"])
+        chk("subset -> exactly the named source", "github.com" in hosts)
+        chk("subset -> the unnamed ones are gone", not ({"crt.sh", "urlscan.io"} & hosts),
+            sorted({"crt.sh", "urlscan.io"} & hosts))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # The one that matters: this field must not become a way to add hosts.
+    name, d = temp_engagement()
+    try:
+        cfg = dict(BASE_CFG); cfg["recon_sources"] = ["github.com", "evil.example.net"]
+        raised = False
+        try:
+            SC.compile_scope(name, cfg, update=True)
+        except SC.ScopeError:
+            raised = True
+        chk("an unknown host in recon_sources is REFUSED, not silently added", raised)
+        p = os.path.join(d, ".scope_lock", "enforcement.json")
+        leaked = os.path.isfile(p) and "evil.example.net" in json.load(
+            open(p, encoding="utf-8"))["assets"]["hosts"]
+        chk("and it never reaches the asset boundary", not leaked)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     for t in (test_pending_by_default, test_constraints_are_carried_not_asserted,
               test_a_separator_inside_a_payload_is_not_a_new_command,
               test_a_staging_machine_never_edits_the_master_library,
               test_header_audit_catches_a_wrong_header, test_header_audit_does_not_cry_wolf,
               test_access_state_is_never_a_curation_input, test_every_engagement_gets_a_ledger,
+              test_every_engagement_gets_a_plan, test_plan_creation_never_breaks_a_compile,
+              test_plan_creation_never_claims_success_it_did_not_achieve,
+              test_the_task_loop_runs_exactly_once,
               test_program_rate_ceiling_beats_the_library,
               test_every_tool_in_a_chain_is_flagged, test_self_check_does_not_cry_wolf,
               test_manual_only_excludes_scanners, test_permanent_constraints_always_present,
               test_automation_stance_is_read_from_the_program_not_the_config,
               test_automation_stance_is_not_derived_from_the_lock,
-              test_approve_is_the_gate, test_caching):
+              test_approve_is_the_gate, test_caching,
+              test_recon_sources_are_selectable_not_extendable):
         t()
     print(f"\n{_PASS}/{_PASS + _FAIL} passed")
     return 1 if _FAIL else 0

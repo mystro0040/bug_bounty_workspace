@@ -436,7 +436,20 @@ def check_engagement_plan():
                       "%s missing for %s — run `plan.py init --engagement %s`"
                       % (", ".join(missing), eng, eng), planner)
     if not os.path.exists(planner):
-        return record("engagement plan", UNKNOWN, "plan.py not found", planner)
+        # WARN, not UNKNOWN, and the distinction is the point. `clean` is
+        # `no FAIL and no UNKNOWN`, so an UNKNOWN here BLOCKS the session from starting — which is
+        # exactly what this check's own contract says it must never do. The state is reachable
+        # through the normal workflow, not a corner case: `_PLAN.md` and `_COVERAGE.md` travel in
+        # the bucket, while plan.py lives in the framework repo, so any machine holding the bucket
+        # without that repo (a configuration §2C-MIRROR exists to support) lands here.
+        #
+        # UNKNOWN-is-not-a-pass still holds for every SAFETY check, and must. But it earns its keep
+        # by hiding a real failure, and the failure hidden here is "I could not tell whether your
+        # notes are tidy". Blocking an engagement on that teaches the operator to route around the
+        # opsec check, which costs far more than the check was ever worth.
+        return record("engagement plan", WARN,
+                      "plan.py not found — cannot verify the plan is consistent (the plan files "
+                      "are present). Coverage is unverified this session, not known-bad.", planner)
     p = run([sys.executable, planner, "check", "--engagement", eng], timeout=60)
     out = ((p.stdout or "") + (p.stderr or "")).strip()
     if p.returncode == 0:
