@@ -917,9 +917,9 @@ material into them.**
 ### Program data & engagement layout — platform / bounty-vs-no-bounty convention
 Program scope data is filed by **platform → bounty status → program**, and live engagements mirror it:
 - Vault (captured scope data): `simple_vault/data/bugbounty/<platform>/<bounty|no-bounty>/<Program>/`
-  (e.g. `.../hackerone/no-bounty/Epic Games/`, `.../intigrity/bounty/DPG Media/`).
+  (e.g. `.../hackerone/no-bounty/Example Program/`, `.../intigrity/bounty/Another Co/`).
 - Live engagement (this bucket): `engagements/programs/<platform>/<bounty|no-bounty>/<program-slug>/`
-  (slug = lowercase-kebab, e.g. `programs/hackerone/no-bounty/epic-games`). The scope machinery is
+  (slug = lowercase-kebab, e.g. `programs/hackerone/no-bounty/example-program`). The scope machinery is
   path-agnostic — the hook resolves whatever the `active_engagement` pointer says — so nesting is safe.
   Keep the vault folder and the live engagement mirrored.
 - **`bounty` vs `no-bounty`** records whether the program pays. A `no-bounty` (VDP) program is still worth
@@ -1025,10 +1025,10 @@ You can work several engagements in parallel (e.g. long enum on one while active
 walled to its OWN scope-lock, by pinning a terminal's engagement with an env var before launch:
 ```
 AO_ENGAGEMENT=programs/hackerone/bounty/example-program     claude    # terminal A → Example-Program ONLY
-AO_ENGAGEMENT=programs/hackerone/no-bounty/epic-games claude   # terminal B → Epic ONLY
+AO_ENGAGEMENT=programs/hackerone/no-bounty/other-program claude # terminal B → that one ONLY
 ```
 The scope hook resolves `$AO_ENGAGEMENT` per session (falling back to the shared `active_engagement`
-pointer when unset). Isolation is real: terminal B's commands are gated to Epic's assets and **cannot
+pointer when unset). Isolation is real: terminal B's commands are gated to that engagement's assets and **cannot
 touch that engagement's**, and vice-versa. Fail-closed: unset/invalid/missing scope-lock ⇒ locked.
 - **Confirm at session start** which engagement you're pinned to (`echo $AO_ENGAGEMENT`) before testing.
 - **Separate sessions, never the same resumed hash in two terminals** (that corrupts the transcript).
@@ -1442,6 +1442,32 @@ baseline pace, and this caps what you do when the TARGET pushes back. Applies to
 to any sub-agents you spawn.
 
 ### Keep progressing — never ask permission to continue permitted work
+
+**THE FAILURE THIS KEEPS TAKING, named precisely (2026-08-03).** This rule has been in this file
+for weeks, and the operator has still had to repeat it across many sessions — enough that they
+finally asked for it to be promoted through the learning loop to "make a dent". So the problem is
+not that the rule is missing. It is that the rule does not describe the moment it gets broken.
+
+The moment is **the end of a report**. A surface is finished, the write-up reads like completion,
+and the next line becomes "what would you like next?" — with two untested in-scope surfaces sitting
+right there in `_PLAN.md`. That is not asking permission for something forbidden; it is treating a
+natural pause in NARRATION as a pause in WORK. They are not the same thing and the operator pays
+for the confusion.
+
+**So: a report is not a stopping point. Finish the report, then start the next thing in the same
+turn.** If the next surface is already identified, you do not need to be told to move to it — being
+identified IS the instruction. Report what you found and what you are now doing, in that order.
+
+**Exactly two things justify stopping:**
+
+1. **Something only the operator can provide** — an approval, a credential, a decision that costs
+   money or widens scope. Ask crisply, and keep working on everything that does not depend on it.
+2. **A periodic check-in**, after a few hours of sustained work. Phrase it as "checking in", never
+   as "may I continue". The difference matters: one is a status, the other hands them a decision
+   they already made.
+
+Anything else — keep going.
+
 In autonomous mode (AUTONOMOUS_MODE: true), NEVER stop or end a working pass to ask the operator
 "should I keep going?" for work that is already permitted — i.e. in-scope, non-forbidden, and within the
 approved TTPs. Just do it. When you PARK an operator-dependent decision (a new target, a needed test

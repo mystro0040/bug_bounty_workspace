@@ -123,7 +123,6 @@ def _resolve_ttp_library():
 
 FRAMEWORK, FRAMEWORK_SOURCE_IS = _resolve_ttp_library()
 
-
 # ---------------------------------------------------------------- permanent constraints (Step 2c)
 DOS_DENY = [r"hping3", r"slowloris", r"slowhttptest", r"\bt50\b", r"--flood", r"\bsiege\b",
             r"\bab\b.*-n\s*[0-9]{5,}", r"\bmhddos\b"]
@@ -176,6 +175,60 @@ def recon_sources_for(cfg):
                 "assets belong in `hosts`, where they are reviewed as assets." % ", ".join(unknown))
         return [h for h in RECON_SOURCES if h in v]
     raise ScopeError("recon_sources must be true, false, or a list of recon hostnames")
+
+
+def osint_sources_for(cfg):
+    """Hosts the operator approved for READING. Not targets, and never merged into `hosts`.
+
+    THE PROBLEM THIS SOLVES. An agent regularly needs to read something that is not a target: the
+    vendor's documentation for the product under test, an advisory page, a public repository, a
+    page the operator explicitly points it at. Before this, the only way to permit that was to put
+    the host in `hosts` — which authorises the ENTIRE engagement allow-list against it. Every
+    scanner, every fuzzer.
+
+    A real engagement in this workspace did exactly that: the vendor's documentation and download
+    hosts sat in its host list, with a sentence in `out_of_scope` explaining they were "ONLY to
+    read manuals" and "not a thing to test". Nothing enforced that sentence. Checked against the
+    live wall, a vulnerability scanner and a content fuzzer aimed at the vendor's documentation
+    site were both permitted. Reading a manual and testing a host were the same permission, so
+    granting one granted the other.
+
+    They are now separate. These compile to `assets.osint`, and the wall permits only passive
+    reads against them (see osint_violation in the enforcement hook): no scanner, no fuzzer, no
+    request that writes. A host in BOTH lists is governed by the ordinary scope, since the program
+    genuinely authorised it as a target.
+
+    UNLIKE `recon_sources`, this is NOT a selection from a fixed list — it is a per-engagement
+    grant, because what an agent needs to read is specific to the product. That makes operator
+    review the control: these appear in the compiled profile and the operator approves them along
+    with everything else. An agent adding one is proposing it, not granting it.
+
+    Deliberately NOT permitted here: the target's own live hosts. If a host is an asset, it belongs
+    in `hosts` where it is reviewed as an asset. Listing a target here would be a way to reach it
+    while bypassing the asset review, which is the opposite of the point.
+    """
+    v = cfg.get("osint_sources", [])
+    if not v:
+        return []
+    if not isinstance(v, (list, tuple)):
+        raise ScopeError("osint_sources must be a list of hostnames")
+
+    cleaned = []
+    for entry in v:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ScopeError("osint_sources entries must be non-empty hostnames")
+        host = entry.strip().lower()
+        if "://" in host or "/" in host:
+            raise ScopeError(
+                f"osint_sources takes bare hostnames, not URLs: {entry!r}. The wall matches on "
+                "host, so a path here would be silently ignored and read as a broader grant than "
+                "intended.")
+        if "*" in host:
+            raise ScopeError(
+                f"osint_sources does not accept wildcards: {entry!r}. A wildcard OSINT grant would "
+                "authorise reading an entire domain the operator never looked at. Name the hosts.")
+        cleaned.append(host)
+    return sorted(set(cleaned))
 
 LOCAL_HELPERS = ["jq", "grep", "sed", "awk", "cat", "echo", "printf", "sort", "uniq", "tee",
                  "python3", "git", "gh", "sha256sum", "sha512sum", "file", "gpg", "wc", "head",
@@ -268,6 +321,9 @@ def load_tasks():
     return out
 
 
+# What a technique needs before it can actually be RUN. This is annotation, never curation.
+# A gated technique is approved into the profile exactly like any other; the gate is recorded so
+# the operator can see, on day one, what is locked and what single thing would unlock the most.
 # Regexes, not substrings, and the reason is one word: "unauthenticated" CONTAINS "authenticated".
 # A substring match tagged a read-only header-disclosure technique as needing a login because its
 # own text said it needs no authentication. Anything matching the negative phrases is excluded first.
@@ -524,12 +580,12 @@ def emit_commands(task, cfg):
 # ---------------------------------------------------------------- automation stance gate
 #
 # WHY THIS EXISTS
-#   A program page stated, verbatim, that it could not accept submissions found by using
-#   automatic scanners. That sentence sat in the captured program data the whole time and never
+#   Exact's program page says, verbatim: "We cannot accept any submissions found by using
+#   automatic scanners." That sentence sat in `_program-data/info.txt` the whole time and never
 #   reached `scope.md`, so the compiled lock allowed sqlmap, nuclei, ffuf, feroxbuster, katana,
 #   gobuster, dalfox and amass against a program that would have thrown out anything they found.
-#   A sibling engagement on the same platform carried the identical rule and enforced it
-#   correctly — same rule, two sessions, two outcomes.
+#   The sibling Intigriti engagement carried the identical rule and enforced it correctly — same
+#   platform, same sentence, two sessions, two outcomes.
 #
 #   `manual_only` was, and still is, a value the caller supplies. Nothing checked it against what
 #   the program actually said. That is a rule enforced by whoever remembered it, which is not
@@ -537,8 +593,8 @@ def emit_commands(task, cfg):
 #   compile a scanner-enabled profile for a program whose own words forbid it.
 #
 #   Deliberately derived from the PROGRAM DATA, never from the compiled lock. A previous attempt
-#   inferred manual-only from the lock's deny-list and wrongly stripped 23 scanner TTPs from a
-#   program that explicitly permits automated scanning at a stated rate. The lock is downstream; reading it
+#   inferred manual-only from the lock's deny-list and wrongly stripped 23 scanner TTPs from CLEAR,
+#   which explicitly permits automated scanning at <= 5 req/s. The lock is downstream; reading it
 #   to decide what the lock should say is circular.
 
 # Unambiguous prohibitions. A hit here refuses the compile unless manual_only is set.
@@ -552,8 +608,8 @@ _AUTOMATION_BANNED = [
     r"automat(?:ed|ic)\s+scanners?[^.\n]{0,40}(?:prohibited|forbidden|not\s+allowed)",
 ]
 
-# Mentions automation in a way that might matter but isn't a ban — e.g. "reports from automated
-# scanners will be closed as Not Applicable", which restricts what counts as EVIDENCE,
+# Mentions automation in a way that might matter but isn't a ban — e.g. Anthropic's "reports from
+# automated scanners will be closed as Not Applicable", which restricts what counts as EVIDENCE,
 # not whether you may run the tool. Surfaced loudly and recorded; never blocking, because treating
 # every scanner mention as a ban would make the gate something operators learn to override.
 _AUTOMATION_REVIEW = [
@@ -670,8 +726,8 @@ def detect_identification_header(engagement):
 def _enforce_identification_header(engagement, cfg_header_name):
     """Refuse a profile whose attribution header is not the one the program asks for.
 
-    WHY: one program's page asked for a header the compiled lock did not carry — the lock had
-    another platform's convention instead. Requests went out attributed, but under a header that
+    WHY: one program's page asks for `X-HackerOne-Research`. The compiled lock carried `X-Bug-Bounty`,
+    which is the Intigriti convention — so requests went out attributed, but under a header the
     program does not look for, and the finding's method section stated the wrong one. The header
     is a per-program value that differs by a single word between programs run in the same week
     (`X-HackerOne-Research` / `X-HackerOne-Researcher` / `X-HackerOne-Handle` / `X-Bug-Bounty`),
@@ -874,6 +930,10 @@ def compile_scope(engagement, cfg, update=False):
         "assets": {"hosts": cfg["hosts"] + recon_sources_for(cfg),
                    "wildcards": cfg.get("wildcards", []), "cidrs": [], "ips": [],
                    "endpoints": cfg.get("endpoints", []),
+                   # A SEPARATE key, never folded into hosts. Merging them here would be a one-line
+                   # convenience that silently re-creates the exact hole this field exists to
+                   # close: everything in `hosts` is a legitimate target for every approved tool.
+                   "osint": osint_sources_for(cfg),
                    "out_of_scope": cfg.get("out_of_scope", [])},
         "program_rules": cfg["program_rules"],
         "operational_constraints": {
@@ -911,6 +971,16 @@ def compile_scope(engagement, cfg, update=False):
     with open(approved_path, "w", encoding="utf-8") as fh:
         yaml.safe_dump(profile, fh, sort_keys=False, width=110, allow_unicode=True)
 
+    # rate_ceiling is written so the WALL can enforce it, not just the library.
+    #
+    # Until this line existed, `rate` was used to rewrite the TTP command templates and then
+    # thrown away. That covered commands generated from approved_TTPs.yaml and nothing else, so a
+    # hand-written `httpx … -rl 50` against a 5 req/s program sailed through — the hook had no
+    # ceiling to compare against, and the only backstop was the hard DoS floor at 100+. Measured
+    # 2026-07-27: -rl 5 allowed, -rl 50 allowed, -rl 99 allowed, denied only at 150.
+    #
+    # A rate limit is a promise made to the program. A promise the wall cannot check is a policy,
+    # and this workspace has repeatedly found that policy without a mechanism enforces nothing.
     enforcement = {"engagement": os.path.basename(engagement), "approved": False,
                    "source_scope_sha256": sha, "allowed_binaries": allowed,
                    "always_allowed_extra": [], "denied_patterns": denied,
@@ -922,8 +992,9 @@ def compile_scope(engagement, cfg, update=False):
     # The PLAN and COVERAGE ledger, seeded from the assets that were just compiled. Same reasoning
     # as ensure_ledger above and the same failure it prevents: the coverage matrix has been required
     # by global/CLAUDE.md 1B for weeks and a survey on 2026-08-02 found one in 3 of 15 engagements.
-    # Created here because every engagement is scoped, so no engagement can start without somewhere
-    # to record what has been exercised and where the thread was left.
+    # Three separate engagements contained hand-rolled substitutes, which is a specification rather
+    # than a coincidence. Created here because every engagement is scoped, so no engagement can
+    # start without somewhere to record what has been exercised and where the thread was left.
     plan_made = ensure_plan(d, engagement)
 
     problems = self_check(engagement)
@@ -959,8 +1030,8 @@ def self_check(engagement):
     # Read defensively. A profile predating a schema change is missing keys, and an unhandled
     # KeyError here reads to the caller as "the checker is broken" rather than "the profile is
     # broken" — so nobody investigates, and the check is fail-open in effect. Three engagements
-    # crashed this way on `automation` before this was written; the missing field is now
-    # reported as the problem it is.
+    # crashed this way on `automation` before this was written; the missing field is now reported
+    # as the problem it is.
     oc = prof.get("operational_constraints") or {}
 
     if "automation" not in oc:

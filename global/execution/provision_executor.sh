@@ -116,6 +116,36 @@ install_pd() {
     && record_hash "$BIN/$tool" "$url"
 }
 
+# --------------------------------------------------------------- PATH for NON-interactive ssh
+#
+# Installing to ~/.local/bin is only half the job. Remote dispatch runs `ssh host 'cmd'`, which is
+# a NON-interactive, NON-login shell: it does not read ~/.profile, where the distro puts the
+# ~/.local/bin entry. So every tool installed fine and `command -v` found none of them, and a
+# dispatch failed claiming the box did not have the tool. Measured 2026-08-04: the provisioner
+# logged 12 tools INSTALLED and then reported all 12 MISSING in the same run.
+#
+# The export must go ABOVE Debian's stock early return in .bashrc —
+#     case $- in *i*) ;; *) return;; esac
+# — because bash DOES source .bashrc when sshd invokes it for a remote command, but that line
+# returns before anything below it executes.
+ensure_path() {
+  local mark="# offsec-toolchain-path" rc="$HOME/.bashrc"
+  if grep -q "$mark" "$rc" 2>/dev/null; then
+    log "PATH already wired into $rc"
+    return
+  fi
+  cp "$rc" "$rc.bak-offsec" 2>/dev/null || true
+  { echo "$mark - must sit ABOVE the non-interactive early return or ssh 'cmd' never sees it"
+    echo 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH";; esac'
+    echo 'export PATH'
+    echo ""
+    cat "$rc.bak-offsec" 2>/dev/null || true
+  } > "$rc.new" && mv "$rc.new" "$rc"
+  log "PATH wired into $rc (backup at $rc.bak-offsec)"
+}
+ensure_path
+export PATH="$BIN:$PATH"      # so THIS run's `have` checks and --verify see what it just installed
+
 for t in $PD_TOOLS; do
   if have "$t"; then log "SKIP $t (already present: $(command -v "$t"))"; else install_pd "$t"; fi
 done

@@ -65,6 +65,19 @@ DEFAULT_SAFE = {
     # a keyserver). Both can reach the network, so they stay an operator action. `gpgv` verifies
     # against a local keyring only.
     "clamscan", "gpgv", "sha512sum", "b2sum", "cksum",
+    # DISK-USAGE INSPECTION. `global/CLAUDE.md` §2F-LOCAL does not merely permit these, it
+    # REQUIRES them: "Check the input first. `du -sh <dir>` / `wc -c <file>`. Hundreds of MB means
+    # stream it." Denying `du` meant the wall refused the command its own config tells an agent to
+    # run before every heavy pass — the identical defect as the `ulimit` gap fixed on 2026-07-30,
+    # and it produces the identical result: the safety step gets skipped because it is the step
+    # that gets blocked. Both are read-only and neither can reach a network.
+    "du", "df",
+    # PROCESS INSPECTION. §2F-STOP requires confirming nothing is still running before reporting a
+    # clean stop — "kill YOUR OWN PIDs", "check with `pgrep -a`". Denying `ps` means the verification
+    # step the config mandates cannot be performed, which is the same shape as the `du` and `ulimit`
+    # gaps. Read-only, local, cannot reach a network. NOT included: `kill`/`pkill`/`killall`, which
+    # act rather than observe and can destroy a parallel engagement's work (§2F-PARALLEL).
+    "ps", "pgrep", "pidof", "uptime", "free", "nproc", "id", "whoami", "hostname", "uname",
     # Shell builtins that ARE commands: local, non-network, and unavoidable in ordinary scripting.
     # They live here rather than in a skip list so they are recognised and allowed — skipping them
     # would leave a command with no identifiable binary, which fails closed. `[` and `[[` are the
@@ -190,12 +203,40 @@ ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # shell wrappers that hide the real binary inside a quoted string argument
 # (`bash -c "sqlmap ..."`, `eval "nmap ..."`) — without unwrapping these, only the
 # wrapper ('bash'/'eval') would be seen and the offensive binary would slip past.
-SHELL_C_RE = re.compile(r"\b(?:bash|sh|zsh|dash|ksh|ash)\b[^\n]*?\s-c\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))")
+#: `bash -c "…"` hides a command inside a quoted payload, so the payload is unwrapped and parsed.
+#:
+#: The shell name must START A TOKEN. It used to be a bare `\b(?:bash|sh|…)\b`, which matches the
+#: `sh` inside the HOSTNAME `crt.sh` — a word boundary sits either side of it. So
+#:
+#:     curl -s 'https://crt.sh/?q=x' -o out.json; wc -c list.json
+#:
+#: matched, took everything after the next ` -c ` as an inner command, and denied `list.json` as an
+#: unapproved binary. crt.sh is one of the framework's OWN approved recon sources, so this broke
+#: passive certificate-transparency enumeration for every engagement — the first thing you do
+#: against a live target, and the safest.
+#:
+#: The lookbehind requires start-of-string or a separator before the name, with an optional
+#: directory prefix so `/bin/sh -c` and `/usr/bin/env sh -c` still unwrap. A hostname component
+#: like `.sh` is preceded by a dot and no longer matches. Pinned by test_wall_false_positives.
+SHELL_C_RE = re.compile(
+    r"(?:^|(?<=[\s;|&(]))(?:/\S*/)?(?:bash|sh|zsh|dash|ksh|ash)\b"
+    r"[^\n]*?\s-c\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))")
 EVAL_RE = re.compile(r"\beval\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))")
 
 # flags by which common offensive tooling reads its target list FROM A FILE (invisible on
 # the command line): nmap -iL, httpx/nuclei -l/-list, subfinder -dL, etc.
 TARGET_LIST_FLAGS = {"-iL", "-l", "-list", "--list", "-dL", "--targets", "--target-list"}
+
+#: Tools that actually READ a file of targets. The flags above are only interpreted as a target
+#: list when one of these is the program being run — see file_fed_targets() for the measured
+#: false positives that made this necessary. Erring wide here is safe: a tool listed but not
+#: really taking a list only means the hook reads one extra file and verifies its contents.
+TARGET_LIST_TOOLS = {
+    "nmap", "masscan", "naabu", "httpx", "dnsx", "nuclei", "subfinder", "katana", "puredns",
+    "shuffledns", "amass", "assetfinder", "gau", "waybackurls", "tlsx", "cdncheck", "ffuf",
+    "feroxbuster", "gobuster", "dirsearch", "wfuzz", "sqlmap", "nikto", "wpscan", "gowitness",
+    "hakrawler", "gospider", "dalfox", "arjun", "interactsh-client", "qsreplace",
+}
 
 URL_RE = re.compile(r"https?://([^/\s\"'`>|\\]+)", re.I)
 IPV4_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
@@ -211,6 +252,13 @@ FILE_EXT = {"txt", "js", "json", "yaml", "yml", "md", "html", "htm", "php", "xml
             # `so` is deliberately absent: it is Somalia's ccTLD, and a real host could end in it.
             "xz", "tgz", "zst", "lz", "tbz", "whl", "wasm", "sig", "asc", "lock",
             "deb", "rpm", "apk", "jar", "war", "iso", "dmg", "msi", "node",
+            # CONTAINER AND DISK IMAGES. `podman load -i servu-ready-v15.5.1.104.img` was denied
+            # for "targeting servu-ready-v15.5.1.104.img" — a local file, no network, on the one
+            # engagement whose entire asset list is localhost. Software-target programs ship as
+            # versioned images, so the dotted-version-plus-extension shape is the norm there, not
+            # an edge case. None of these is a TLD (checked against the same concern that keeps
+            # `so` off this list).
+            "img", "qcow2", "vmdk", "ova", "vdi", "squashfs",
             # JS/TS module extensions. Same defect as the archive block above, found the same way:
             # `node harness.mjs` was denied because `mjs` was read as a TLD. These are unavoidable
             # when a PoC targets a JS/TS codebase, which is most of this workspace's source-audit
@@ -800,6 +848,22 @@ def candidate_binaries(cmd):
         if ASSIGN_RE.match(tok):
             continue
         if tok.startswith("-"):
+            # We only reach here in COMMAND position (`expect` is still set), and no command is
+            # ever named `-something`. So this token is really an argument, which means an earlier
+            # token put us back into command position wrongly — `\( -name "info*" \)` is the case
+            # that found this: the `(` reset `expect`, the `-name` flag was skipped WITHOUT
+            # clearing it, and the glob `info*` after it was then read as a program name and
+            # denied. Measured 2026-08-03: parsed as ['find', 'info*'].
+            #
+            # Clearing `expect` here fixes that. It cannot hide a real command, because a command
+            # cannot begin with a dash.
+            #
+            # EXCEPT a bare `--`, which is the end-of-options marker: in `env -- prog` and
+            # `bwrap … -- prog` the token AFTER it genuinely IS the command. Clearing `expect`
+            # there would stop that program being checked at all, turning a noise fix into a
+            # fail-OPEN hole. Pinned by test_end_of_options_still_checked.
+            if tok != "--":
+                expect = False
             continue
         if NON_BINARY_ARG_RE.match(tok):
             # A duration or count belonging to the introducer (`timeout 60 …`), not a program.
@@ -895,11 +959,26 @@ def file_fed_targets(command, project_dir, limit=262144):
         toks = shlex.split(command, comments=False, posix=True)
     except ValueError:
         toks = command.split()
-    for i, t in enumerate(toks):
-        if t in TARGET_LIST_FLAGS and i + 1 < len(toks):
-            files.append(toks[i + 1])
-        elif "=" in t and t.split("=", 1)[0] in TARGET_LIST_FLAGS:
-            files.append(t.split("=", 1)[1])
+    # A target-list flag only MEANS a target list on a tool that takes one. `-l`, `-list` and
+    # `--list` are in TARGET_LIST_FLAGS because httpx/dnsx/nuclei/naabu use them that way — but
+    # `--list` on any other program overwhelmingly means "show me a list", and `-l` means
+    # "long format" to half the coreutils.
+    #
+    # Ungated, the token AFTER such a flag was captured as a target-list FILE, failed to resolve,
+    # and the whole command was denied fail-closed. Measured 2026-08-03 on two real commands:
+    # `python3 workspace.py test --list 2>&1 | tail` captured `2>&1`, and
+    # `( ulimit -v N; python3 workspace.py test --list )` captured `)`. Neither is a file, and
+    # neither command touches a network.
+    #
+    # Gating on the TOOL rather than dropping the flags keeps the protection exactly where it
+    # matters: `httpx -l targets.txt` is still read and still verified against the asset boundary
+    # (pinned by test_still_blocked).
+    if set(candidate_binaries(command)) & TARGET_LIST_TOOLS:
+        for i, t in enumerate(toks):
+            if t in TARGET_LIST_FLAGS and i + 1 < len(toks):
+                files.append(toks[i + 1])
+            elif "=" in t and t.split("=", 1)[0] in TARGET_LIST_FLAGS:
+                files.append(t.split("=", 1)[1])
     # stdin redirect: `tool < file`. The lookarounds exclude `<<` — that is a HEREDOC introducing
     # literal text, not a file of targets. Without them, `python3 - <<'PY'` captured the delimiter
     # `'PY'` as a target-list file, failed to resolve it, and denied every inline script.
@@ -1093,8 +1172,85 @@ def production_write_violation(command, prod_paths):
     return None
 
 
+#: Tools that can plausibly READ a document. Everything else is refused against an OSINT source,
+#: including tools this engagement is otherwise fully authorised to run.
+#:
+#: An ALLOW-list rather than a deny-list of scanners, deliberately. A deny-list has to predict
+#: every scanner that will ever exist; this only has to name the handful of things that fetch a
+#: page. A tool nobody thought about fails CLOSED, which is the right direction for a boundary
+#: whose entire purpose is that it cannot be crossed by accident.
+OSINT_PASSIVE_BINARIES = {"curl", "wget", "git", "python3", "python"}
+
+#: Markers that a request WRITES rather than reads. Checked even for the passive binaries above,
+#: because `curl` reads a manual and `curl -X POST -d ...` is an interaction with someone else's
+#: system that no OSINT grant covers.
+OSINT_ACTIVE_MARKERS = [
+    (r"-X\s*(POST|PUT|DELETE|PATCH|OPTIONS)", "an HTTP method other than GET/HEAD"),
+    (r"(?:^|\s)(?:-d|--data|--data-raw|--data-binary|--data-urlencode)(?:\s|=)", "a request body"),
+    (r"(?:^|\s)(?:-F|--form)(?:\s|=)", "a form upload"),
+    (r"(?:^|\s)(?:-T|--upload-file)(?:\s|=)", "a file upload"),
+    (r"\bFUZZ\b", "a fuzzing placeholder"),
+    (r"(?:^|\s)(?:-w|--wordlist)(?:\s|=)", "a wordlist"),
+    (r"\brequests\.(post|put|delete|patch)\b", "a non-GET request in Python"),
+    (r"\.(post|put|delete|patch)\s*\(", "a non-GET request"),
+]
+
+
+def osint_only_hosts(assets):
+    """OSINT sources that are NOT also ordinary in-scope targets.
+
+    A host can legitimately be both — a vendor's site can be a target AND where the docs live. In
+    that case the engagement's real scope governs and no extra restriction applies. Only a host
+    whose sole authorisation is the OSINT grant gets walled to passive reads.
+    """
+    osint = {h.lower() for h in (assets.get("osint") or [])}
+    real = {h.lower() for h in (assets.get("hosts") or [])}
+    real |= {w.lower() for w in (assets.get("wildcards") or [])}
+    return osint - real
+
+
+def osint_violation(command, dest, assets):
+    """Why this command may not be aimed at this OSINT source. None if it is a legitimate read.
+
+    THE POINT OF THIS FUNCTION. Before it existed, the only way to let an agent read a vendor's
+    documentation was to add that host to `assets.hosts` — which authorised every tool in the
+    engagement against it. A real engagement here did exactly that: the vendor's documentation and
+    download hosts sat in its host list, with a sentence in `out_of_scope` saying they were "ONLY
+    to read manuals" and "not a thing to test". That sentence was policy with nothing enforcing it.
+    Driven against the live wall, a vulnerability scanner and a content fuzzer aimed at the
+    vendor's documentation site were both ALLOWED.
+
+    Reading a manual and testing a host are different permissions. They now have different
+    mechanisms.
+    """
+    if dest.lower() not in osint_only_hosts(assets):
+        return None
+
+    for b in sorted(candidate_binaries(command)):
+        if b in DEFAULT_SAFE or b in SHELL_BUILTINS:
+            continue
+        if b not in OSINT_PASSIVE_BINARIES:
+            return (f"'{b}' is not a passive read. An OSINT source may be READ — never scanned, "
+                    f"enumerated, fuzzed or tested. Fetch the page with curl/wget instead.")
+
+    for pattern, what in OSINT_ACTIVE_MARKERS:
+        try:
+            if re.search(pattern, command, re.I):
+                return (f"the command carries {what}. An OSINT source may be READ only; anything "
+                        f"that writes to, probes, or interacts with it is out of bounds.")
+        except re.error:
+            continue
+
+    return None
+
+
 def dest_allowed(dest, assets):
     if dest in LOCAL_HOSTS:
+        return True
+    # OSINT sources are legitimate DESTINATIONS. What may be done to them is then narrowed by
+    # osint_violation() — two separate questions, answered in two separate places, so that
+    # widening "may I reach it" can never silently widen "what may I do to it".
+    if dest.lower() in {h.lower() for h in (assets.get("osint") or [])}:
         return True
     try:
         ip = ipaddress.ip_address(dest)
@@ -1348,6 +1504,30 @@ def main():
                          "variable, a glob, or piped stdin). Inline the in-scope targets on the "
                          "command line, or point it at a readable in-scope target list. "
                          "Blocked (fail-closed).")
+
+    # ---- 4) OSINT sources are READ-ONLY -------------------------------------------------------
+    #
+    # Runs regardless of `offensive_used`, unlike the asset boundary above. That is deliberate: the
+    # asset wall exists to stop offensive tooling reaching an unapproved host, so it can reasonably
+    # skip commands made only of safe binaries. This check exists to stop an APPROVED host being
+    # treated as a target, and the tools that would do that are exactly the ones the engagement has
+    # already authorised. Gating it on `offensive_used` would have made it a no-op for the case it
+    # was written for.
+    if assets.get("osint"):
+        for dest in sorted(extract_destinations(command)):
+            why = osint_violation(command, dest, assets)
+            if why:
+                emit("deny",
+                     f"'{dest}' is an OSINT SOURCE for engagement '{active_name}', not a target — "
+                     f"and {why}\n\n"
+                     f"An OSINT source is a place the operator approved for READING: vendor "
+                     f"documentation, an advisory, a public repository. It is somebody else's "
+                     f"system that this program never authorised anyone to test. Reading it is "
+                     f"permitted; probing it is not, no matter what this engagement's allow-list "
+                     f"contains.\n\n"
+                     f"If this host genuinely IS a target, that is a scope change: add it to the "
+                     f"scope file's hosts and re-run `/generate-scope --update`. Do not reword the "
+                     f"command.")
 
     emit("allow")
 
