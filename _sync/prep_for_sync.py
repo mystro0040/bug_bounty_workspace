@@ -34,7 +34,54 @@ preserved copy; `--restore` puts it back byte-for-byte.
 """
 import os, sys, zipfile, hashlib, shutil, datetime
 
-BUCKET = "/home/primaryu/Workspace/buckets/bug-bounty-workspace-bucket"
+def _resolve_bucket(argv):
+    """The bucket root this run operates on.
+
+    Derived from THIS FILE's location (the parent of the `_sync/` directory holding it), so the
+    same script works in any bucket instead of only the one it was written in. `--bucket PATH`
+    overrides, which is what the tests use.
+
+    WHY IT IS NOT A CONSTANT. It was one — a hardcoded absolute path to the bug-bounty bucket, with
+    nothing parsing `--bucket` at all. Two live consequences, both from the same line:
+
+      1. A copy of this script in another bucket still staged and DELETED inside the bug-bounty
+         bucket, which the operator was not looking at.
+      2. The test suite passes `--bucket <tempdir>` and states in its own docstring that "nothing
+         here touches a real bucket". The flag was ignored, so every run of the suite operated on
+         the REAL bucket: it silently rewrote the real tree-manifest.json, and `--zip --yes` would
+         have zipped and removed real directories the moment one matched. It had simply never
+         matched yet, which is luck rather than safety.
+
+    Both were properties asserted in prose that no code implemented. Resolution happens at import,
+    before any other module-level path is derived from it, so there is no window in which half the
+    constants point at one tree and half at another.
+
+    The pentest workspace's copy already worked this way; this brings the two back into step.
+    """
+    chosen = None
+    for i, a in enumerate(argv):
+        if a == "--bucket" and i + 1 < len(argv):
+            chosen = argv[i + 1]
+            break
+        if a.startswith("--bucket="):
+            chosen = a.split("=", 1)[1]
+            break
+    if chosen is None:
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    resolved = os.path.abspath(os.path.expanduser(chosen))
+    # This tool removes directories, so being handed a wrong or empty path is the expensive
+    # mistake. "Has a _sync/ directory" is the cheapest available sanity check — a real bucket
+    # always does, because that is where this script lives.
+    if not os.path.isdir(resolved):
+        sys.exit(f"[!] --bucket {resolved} is not a directory. Refusing.")
+    if not os.path.isdir(os.path.join(resolved, "_sync")):
+        sys.exit(f"[!] --bucket {resolved} has no _sync/ directory, so it does not look like a "
+                 "bucket.\n    Refusing rather than staging or deleting inside an unknown tree.")
+    return resolved
+
+
+BUCKET = _resolve_bucket(sys.argv[1:])
 SYNC_DIR = os.path.join(BUCKET, "_sync")
 ARCHIVE_DIR = os.path.join(SYNC_DIR, "archives")
 MANIFEST = os.path.join(SYNC_DIR, "SYNC-MANIFEST.md")
@@ -221,14 +268,95 @@ MANIFEST_EXCLUDES = [
     "*/sandbox/*/venv/*", "*/sandbox/*/.venv/*", "*/node_modules/*",
     # Any venv anywhere — must stay in step with SYNC_EXCLUDES in s3_utils.py, or the manifest
     # records files the sync refuses to carry and every verify reports them MISSING.
-    "*/venv/*", "venv/*", "*/.venv/*", ".venv/*",
+    # NOTE the trailing `*` on the directory name, for the same reason it is there in
+    # SYNC_EXCLUDES: `*/venv/*` matches a directory called exactly `venv`, and the venv that
+    # prompted the fix was named `venv-sftp`. `venv*` covers venv, venv-sftp, venv3, .venv.
+    "*/venv*/*", "venv*/*", "*/.venv*/*", ".venv*/*",
     "*/site-packages/*", "*/__pypackages__/*",
+    "*/pyvenv.cfg", "pyvenv.cfg",
     ".git/*",
     # The manifest is written after the walk, so it can never be in its own record. Left in, it
     # shows up as a spurious "1 new" on every single verify — small, permanent, and exactly the
     # kind of constant noise that trains someone to stop reading the output.
     "_sync/tree-manifest.json",
 ]
+
+
+# The comment above says these two lists "must stay in step". That sentence had been sitting there
+# for a day when a forced pull reverted this file to an older copy and put them out of step — and
+# nothing noticed, because nothing was checking. A rule with no code behind it is the failure mode
+# this workspace keeps paying for, so here is the code.
+#
+# It reads s3_utils.py rather than importing it, for two reasons that are both about this file
+# working ALONE: importing would drag in sync_guard and sync_digest, and on a machine that has the
+# bucket but not the general_utils repo there is nothing to import at all. A missing s3_utils is
+# not an error here — it means "cannot check from this machine", which is said out loud rather
+# than reported as agreement.
+
+SYNC_SOURCE_CANDIDATES = [
+    os.path.expanduser("~/Workspace/Production_Ready/private/General_Development/"
+                       "general_utils/vault-sync-manager/s3_utils.py"),
+]
+
+
+def _sync_excludes_from_source():
+    """SYNC_EXCLUDES as s3_utils.py actually defines it, or None if it cannot be read here."""
+    import ast
+
+    for path in SYNC_SOURCE_CANDIDATES:
+        if not os.path.exists(path):
+            continue
+        try:
+            tree = ast.parse(open(path, encoding="utf-8").read())
+        except (OSError, SyntaxError):
+            return None
+        found = []
+        for node in ast.walk(tree):
+            # Covers both `SYNC_EXCLUDES = [...]` and the later `SYNC_EXCLUDES += [...]`.
+            target = None
+            value = None
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target, value = node.targets[0], node.value
+            elif isinstance(node, ast.AugAssign):
+                target, value = node.target, node.value
+            if not isinstance(target, ast.Name) or target.id != "SYNC_EXCLUDES":
+                continue
+            if not isinstance(value, ast.List):
+                return None
+            for element in value.elts:
+                if isinstance(element, ast.Constant) and isinstance(element.value, str):
+                    found.append(element.value)
+        return found or None
+    return None
+
+
+def check_excludes_in_step(quiet=False):
+    """Warn when the manifest would record files the sync refuses to carry.
+
+    Returns True when in step or unable to check, False on real drift. The asymmetry is
+    deliberate: MANIFEST_EXCLUDES is allowed EXTRAS (.git, the manifest itself), because skipping
+    something the sync does carry only makes the verify less thorough. The direction that breaks
+    is the other one — a pattern the sync excludes but the manifest records, which makes every
+    single verify report MISSING files that were never going to be there, and that is exactly how
+    someone learns to ignore a checker.
+    """
+    sync_patterns = _sync_excludes_from_source()
+    if sync_patterns is None:
+        if not quiet:
+            print("[i] Could not read SYNC_EXCLUDES from s3_utils.py on this machine — "
+                  "exclude drift not checked.")
+        return True
+
+    missing = [p for p in sync_patterns if p not in MANIFEST_EXCLUDES]
+    if not missing:
+        return True
+
+    print("\n[!] EXCLUDE DRIFT — the sync skips patterns this manifest still records:")
+    for pattern in missing:
+        print(f"      {pattern}")
+    print("    Every --verify will report those as MISSING even though nothing is wrong.")
+    print("    Fix: add them to MANIFEST_EXCLUDES in this file.\n")
+    return False
 
 
 def _manifest_tool():
@@ -259,6 +387,7 @@ def _run_manifest(mode, extra=()):
 
 def do_manifest():
     print("\n=== recording the tree manifest (run this BEFORE pushing) ===")
+    check_excludes_in_step()
     return _run_manifest("record")
 
 
@@ -269,12 +398,31 @@ def do_verify(repair=True):
         print("[i] Nothing to verify against. The manifest has to be recorded on the SENDING")
         print("    machine, before the push. Run --manifest there, then push.")
         return False
+    # Checked here as well as on record, because a verify is where the drift becomes VISIBLE — as
+    # a list of MISSING files that are not actually missing. Saying why, at the moment the
+    # confusing output appears, is worth more than saying it earlier on the other machine.
+    check_excludes_in_step()
     extra = ["--quiet"] + (["--repair-symlinks"] if repair else [])
     return _run_manifest("verify", extra)
 
 
 def main():
-    args = set(sys.argv[1:])
+    # --bucket was already consumed at import time by _resolve_bucket, which had to happen before
+    # any module-level path derived from it. Drop it and its value here so neither is mistaken for
+    # a mode flag.
+    argv, skip = [], False
+    for a in sys.argv[1:]:
+        if skip:
+            skip = False
+            continue
+        if a == "--bucket":
+            skip = True
+            continue
+        if a.startswith("--bucket="):
+            continue
+        argv.append(a)
+
+    args = set(argv)
     if "--restore" in args:
         do_restore()
         # Restore is the receiving side, which is exactly when a loss shows up. Verify without
