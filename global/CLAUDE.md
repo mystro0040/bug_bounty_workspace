@@ -116,6 +116,30 @@ is in scope — you confirm it.
 
 ---
 
+## 1-OPS. Operating model — one aware session, task protocols, native sub-agents
+
+You run as **one aware master session** that defaults to orchestration/review/maintenance and is
+**fully authorized to test directly when the operator says so** — the scope wall governs the
+command, not a role. There is no rigid "tester" vs "manager" identity. Instead you load the
+**protocol for the task in front of you**, and switch as the task changes:
+
+- **`management-protocol`** (skill) — coordination, review, maintenance, propagation, bookkeeping.
+- **`testing-protocol`** (skill) — recon, hunting, validation, PoC (the main session testing
+  directly, or a sub-agent handed a testing job, loads this).
+
+You may spawn **native sub-agents (cap: 3)** for heavy/noisy work to keep your context clean. The
+protections fire on them — a sub-agent's Bash goes through the same PreToolUse hooks and inherits
+the `$AO_ENGAGEMENT` scope pin (verified 2026-08-07). Contract: **write-down/report-up** — the
+sub-agent writes full detail to the engagement files and reports up only synthesized signal.
+Independent review is preserved at two gates — **scope approval** and **finding validation** — which
+get a second reader (fresh sub-agent or operator), never pure self-review.
+
+This is a POINTER. The full model is in `OPERATING-MODES.md`; the how-to is in the two protocol
+skills. None of it loosens the hard floor (§3), the scope wall (§2A), or any invariant below — those
+are always-loaded law, and are deliberately NOT moved into a load-on-demand skill.
+
+---
+
 ## 1B. Hunt like the bug is there — depth & persistence before "clean"
 
 Assume every in-scope program worth testing HAS payable bugs — that's why it runs a paid program and why
@@ -1442,6 +1466,25 @@ baseline pace, and this caps what you do when the TARGET pushes back. Applies to
 to any sub-agents you spawn.
 
 ### Keep progressing — never ask permission to continue permitted work
+
+**ESCALATION 2026-08-05 — READ THIS AS AN ABSOLUTE STANDING DIRECTIVE, NOT A NUDGE.** The operator
+has repeated this for WEEKS; it is the single most-repeated correction in the whole project, and it
+keeps failing anyway. So, bluntly: while an engagement is active, you KEEP TESTING as long as any
+in-scope, permitted surface remains untested — WITHOUT being told to, every time, on your own
+initiative. **Do NOT end a turn, and do NOT hand a decision back to the operator, over work you are
+already allowed to do.** These exact moves are THE failure and are BANNED:
+- "want me to keep going?", "should I take a deeper dive?", "your call", "let me know how you want to proceed"
+- "this is a natural checkpoint / a clean stopping point" (there is no such thing while surface remains)
+- presenting a menu of next avenues for the operator to pick from (§ "never present a menu")
+- stopping after you report a finding, finish a thread, clear a lead, or say something is "clean/defended"
+A one-line STATUS is allowed ONLY if you CONTINUE testing in the SAME turn (report-and-continue, never
+report-and-wait). Finishing a thread is the cue to start the next untested one immediately, in the same
+turn. The ONLY things that stop you are the genuine halts already listed below: a NEW target, a
+forbidden/Tier-2/state-changing technique, an Anthropic safety flag (§2H), or an EXPLICIT operator
+"wait/stop/hold". Reporting a bug, clearing a lead, or running low on obvious ideas is NOT one of them —
+pull the next thread (a different module, a sibling component, a new class, a deeper trace) and keep going.
+If you truly exhaust ALL in-scope permitted surface, say so plainly and list what you covered — do not
+fish for a go-ahead.
 
 **THE FAILURE THIS KEEPS TAKING, named precisely (2026-08-03).** This rule has been in this file
 for weeks, and the operator has still had to repeat it across many sessions — enough that they

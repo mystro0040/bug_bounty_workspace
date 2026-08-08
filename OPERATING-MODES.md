@@ -36,27 +36,41 @@ restart the session so it reloads.
 To run **unattended without per-action prompts**, start the session with
 `claude --permission-mode auto` (or press **Shift+Tab** to cycle to it — `plan` mode only plans, it
 won't execute). Either way, the hook still enforces the hard floor + scope in every permission mode.
-## Two-session operating model (recommended for live engagements)
+## Operating model — one aware session, task-based protocols, native sub-agents
 
-Run the framework as **two coordinated sessions**, not one:
+You run as **one aware master session** (the "Omni-Manager") that defaults to orchestration, review,
+and framework maintenance, and is **fully authorized to test targets directly when the operator says
+so.** There is no "you are a tester" / "you are a manager" identity lock — the scope wall governs the
+command, not the role. Instead the session loads the **protocol for the task in front of it**:
 
-- **Working session** — the engagement executor. Launched from the workspace/bucket root, it loads an
-  engagement and operates strictly inside the scope wall, doing the hunting. Keep its context clean
-  (scope, tools, findings). Tactical, in-engagement questions go here.
-- **Management / auditor session** — an independent overseer, launched separately. It reviews the
-  working session's generated scope and approval requests **from the files**, does framework/config
-  maintenance and repo commits, and relays decisions. Because it sits **outside** the engagement wall,
-  its review is an independent check, not self-review. Strategy / "is this scope safe?" questions go here.
-- **You** are the bridge and the final authority — you approve scope, answer the asks, and decide.
+- **`management-protocol`** (skill) — orchestrating, reviewing scope/findings, maintenance,
+  propagation, session bookkeeping. Load it for coordination-type work.
+- **`testing-protocol`** (skill) — recon, enumeration, hunting, validation, PoC. Load it for
+  hands-on work, whether the main session is testing or a sub-agent was handed a testing job.
 
-**Why split them:** independent review catches what self-review misses; the worker stays focused and
-context-clean; meta-work (config, commits, hardening) happens without disturbing the live run; and if
-the working session crashes, the management session persists to help it recover.
+The same session switches protocols as the task changes. Neither can loosen the hard floor above.
 
-**How they stay in sync — entirely through the engagement files, no screen-sharing needed:**
-- The worker writes state to `_STATUS.md` and **every operator-ask to `_NEEDS-REVIEW/`** (CLAUDE.md
-  §2D, gated by `OPERATOR_ASK_TO_FILE`) — so the auditor/operator can review from the files alone.
-- The operator/auditor hands the worker its next step via `_CONTROL.md` (conditional, stale-safe).
-- A watcher (a monitor, or the auditor session) reads those files and surfaces changes.
+### Native sub-agents — heavy lifting delegated, context kept clean
 
-A single combined session is fine for quick or solo tasks; for a live engagement, prefer the split.
+The master session may spawn **native sub-agents (cap: 3 concurrent)** to do the noisy, heavy work
+so its own context stays clean. The protections fire on them: a sub-agent's Bash calls go through the
+same PreToolUse hooks (`enforce_scope.py`, `ram_guard.py`) as the main session, and inherit the
+`$AO_ENGAGEMENT` scope pin — verified 2026-08-07. The contract is **write-down, report-up**: the
+sub-agent writes full detail to the engagement files as it goes and reports up only the synthesized
+signal (errors, decisions needed, findings). Delegation adds two duties on the manager — reaping the
+sub-agent's processes by PID (§2F-STOP) and declaring their tools to the rate budget (§2F-NET). Full
+mechanics live in `management-protocol`.
+
+### Independent review is preserved at two gates
+
+The value the old two-session split protected was that scope and findings were checked by someone
+outside the work. Keep that at exactly two gates, even as one session: **scope approval** and
+**finding validation** get a second reader — a fresh sub-agent with clean context, or the operator —
+never pure self-review. Scope still never self-approves; the operator is the final authority.
+
+### Separate terminals still work
+
+Running two real terminals (`$AO_ENGAGEMENT` per terminal, §2F-PARALLEL) is still supported for
+parallel engagements. They coordinate **only through the engagement files** — `_STATUS.md`,
+`_NEEDS-REVIEW/` (every operator-ask, CLAUDE.md §2D), `_CONTROL.md` (next step, stale-safe). No
+messaging layer: the `.orchestrator/` blackboard was retired and stays retired.
